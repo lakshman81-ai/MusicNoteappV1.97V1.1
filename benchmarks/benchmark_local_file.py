@@ -292,13 +292,28 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
     ]
 
     rows = []
+    threshold = float(suite_summary.get("threshold", 0.75))
     for case in suite_summary.get("cases", []):
-        pitch_pct = float(case["pitch_accuracy"]) * 100
-        rhythm_pct = float(case["rhythm_accuracy"]) * 100
+        pitch_precision = float(case.get("pitch_precision", case.get("pitch_accuracy", 0.0))) * 100
+        pitch_recall = float(case.get("pitch_recall", case.get("pitch_accuracy", 0.0))) * 100
+        pitch_f1 = float(case.get("pitch_f1", case.get("pitch_accuracy", 0.0))) * 100
+        rhythm_precision = float(case.get("rhythm_precision", case.get("rhythm_accuracy", 0.0))) * 100
+        rhythm_recall = float(case.get("rhythm_recall", case.get("rhythm_accuracy", 0.0))) * 100
+        rhythm_f1 = float(case.get("rhythm_f1", case.get("rhythm_accuracy", 0.0))) * 100
+        pitch_prf = (pitch_precision, pitch_recall, pitch_f1)
+        rhythm_prf = (rhythm_precision, rhythm_recall, rhythm_f1)
+
+        pitch_pct = pitch_f1
+        rhythm_pct = rhythm_f1
         pitch_missed = case.get("pitch_missed", 0)
         pitch_extra = case.get("pitch_extra", 0)
         rhythm_missed = case.get("rhythm_missed", 0)
         rhythm_extra = case.get("rhythm_extra", 0)
+
+        predicted_notes = int(case.get("predicted_notes", 0))
+        reference_notes = int(case.get("reference_notes", 0))
+        note_delta = predicted_notes - reference_notes
+        note_delta_pct = (note_delta / reference_notes) if reference_notes else None
 
         pitch_samples = []
         if case.get("pitch_missed_onsets_sample"):
@@ -329,11 +344,25 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
         if rhythm_samples:
             samples_note.append("Rhythm " + "; ".join(rhythm_samples))
 
+        alerts = []
+        if pitch_pct / 100 < threshold:
+            alerts.append(f"Pitch below threshold ({pitch_pct:.1f}% < {threshold*100:.0f}%).")
+        if rhythm_pct / 100 < threshold:
+            alerts.append(f"Rhythm below threshold ({rhythm_pct:.1f}% < {threshold*100:.0f}%).")
+
+        if note_delta_pct is not None and abs(note_delta_pct) >= 0.10:
+            direction = "over-quantized" if note_delta_pct > 0 else "under-quantized"
+            severity = "Significant " if abs(note_delta_pct) >= 0.20 else ""
+            alerts.append(
+                f"{severity}note count {note_delta:+d} ({note_delta_pct*100:.1f}%) — possible {direction}."
+            )
+
         notes = " ".join(
             [
-                f"{case['predicted_notes']} predicted vs {case['reference_notes']} reference notes.",
+                f"{predicted_notes} predicted vs {reference_notes} reference notes.",
                 pitch_note + ".",
                 rhythm_note + ".",
+                "Alerts: " + " ".join(alerts) if alerts else "",
                 " ".join(samples_note),
                 f"Files: `{Path(case['predicted_musicxml']).name}` / `{Path(case['predicted_midi']).name}`.",
             ]
