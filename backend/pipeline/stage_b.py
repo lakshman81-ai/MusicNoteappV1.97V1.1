@@ -213,91 +213,221 @@ def _segment_notes_from_timeline(
     timeline: List[FramePitch],
     frame_duration: float,
     min_duration: float = 0.06,
-    pitch_jump: float = 0.6,
+    max_duration: float | None = 8.0,
+    rest_threshold: float = 0.08,
+    median_window: int = 5,
 ) -> List[NoteEvent]:
-    notes: List[NoteEvent] = []
+    """Segment notes using a voiced/unvoiced HMM with Viterbi decoding.
+
+    The state space consists of an explicit unvoiced/rest state and a set of
+    MIDI bins derived from the observed timeline. Emission probabilities use
+    smoothed MIDI/confidence estimates, while transition costs adapt to local
+    variability (MAD) to discourage implausible jumps. The decoded state path is
+    post-processed with duration constraints and gap-aware merging.
+    """
+
     if not timeline:
-        return notes
+        return []
 
-    start_time: float | None = None
-    midi_values: List[int] = []
-    conf_values: List[float] = []
-    last_time: float | None = None
+    times = np.array([frame.time for frame in timeline], dtype=float)
+    midi_obs = np.array([frame.midi if frame.midi is not None else np.nan for frame in timeline], dtype=float)
+    conf_obs = np.array([frame.confidence for frame in timeline], dtype=float)
 
-    for frame in timeline:
-        if frame.midi is None:
-            if start_time is not None and last_time is not None:
-                end_time = frame.time
-                duration = end_time - start_time
-                if duration >= min_duration and midi_values:
-                    midi_note = int(round(float(np.median(midi_values))))
-                    pitch_hz = float(librosa.midi_to_hz(midi_note))
-                    confidence = float(np.mean(conf_values)) if conf_values else 0.0
-                    notes.append(
-                        NoteEvent(
-                            start_sec=start_time,
-                            end_sec=end_time,
-                            midi_note=midi_note,
-                            pitch_hz=pitch_hz,
-                            confidence=confidence,
-                        )
-                    )
-                start_time = None
-                midi_values = []
-                conf_values = []
-            last_time = frame.time
-            continue
+    if median_window % 2 == 0:
+        median_window += 1
+    half = median_window // 2
 
-        if start_time is None:
-            start_time = frame.time
-            midi_values = [frame.midi]
-            conf_values = [frame.confidence]
-            last_time = frame.time
-            continue
+    # Smooth MIDI observations with a median filter over voiced frames.
+    smoothed_midi = midi_obs.copy()
+    finite_mask = np.isfinite(midi_obs)
+    global_median = float(np.nanmedian(midi_obs)) if np.any(finite_mask) else np.nan
+    for idx in range(len(midi_obs)):
+        start = max(0, idx - half)
+        end = min(len(midi_obs), idx + half + 1)
+        window = midi_obs[start:end]
+        valid = window[np.isfinite(window)]
+        if valid.size:
+            smoothed_midi[idx] = float(np.median(valid))
+        elif np.isfinite(global_median):
+            smoothed_midi[idx] = global_median
 
-        current_median = float(np.median(midi_values))
-        if abs(frame.midi - current_median) > pitch_jump:
-            end_time = frame.time
-            duration = end_time - start_time
-            if duration >= min_duration and midi_values:
-                midi_note = int(round(current_median))
-                pitch_hz = float(librosa.midi_to_hz(midi_note))
-                confidence = float(np.mean(conf_values)) if conf_values else 0.0
-                notes.append(
-                    NoteEvent(
-                        start_sec=start_time,
-                        end_sec=end_time,
-                        midi_note=midi_note,
-                        pitch_hz=pitch_hz,
-                        confidence=confidence,
-                    )
-                )
-            start_time = frame.time
-            midi_values = [frame.midi]
-            conf_values = [frame.confidence]
+    # Smooth confidence with a small moving average.
+    kernel = np.ones(median_window, dtype=float)
+    smoothed_conf = np.convolve(conf_obs, kernel / kernel.sum(), mode="same")
+
+    if np.all(~np.isfinite(smoothed_midi)):
+        return []
+
+    observed_midis = smoothed_midi[np.isfinite(smoothed_midi)]
+    midi_min = int(np.floor(np.min(observed_midis))) - 1
+    midi_max = int(np.ceil(np.max(observed_midis))) + 1
+    midi_states = list(range(midi_min, midi_max + 1))
+    states: List[int | None] = [None] + midi_states
+
+    # Transition penalty scale based on local variability.
+    midi_diffs = np.diff(observed_midis) if observed_midis.size > 1 else np.array([0.0])
+    mad = float(np.median(np.abs(midi_diffs - np.median(midi_diffs)))) if midi_diffs.size else 0.0
+    jump_scale = max(mad, 0.5)
+
+    sigma = 0.9
+    tiny = 1e-6
+
+    def emission_for_state(state: int | None, midi_value: float, conf_value: float) -> float:
+        if state is None:
+            return float(np.log(max(1.0 - conf_value, tiny)))
+        if not np.isfinite(midi_value):
+            distance = 3.0
         else:
-            midi_values.append(frame.midi)
-            conf_values.append(frame.confidence)
-        last_time = frame.time
+            distance = abs(midi_value - state)
+        likelihood = -0.5 * (distance / sigma) ** 2
+        return likelihood + float(np.log(conf_value + tiny))
 
-    if start_time is not None:
-        end_time = (last_time or start_time) + frame_duration
+    # Build emission matrix (states x frames).
+    emissions = np.zeros((len(states), len(timeline)), dtype=float)
+    for t_idx, (midi_val, conf_val) in enumerate(zip(smoothed_midi, smoothed_conf)):
+        for s_idx, state in enumerate(states):
+            emissions[s_idx, t_idx] = emission_for_state(state, midi_val, conf_val)
+
+    def transition_cost(prev: int | None, nxt: int | None) -> float:
+        if prev is None and nxt is None:
+            return 0.0
+        if prev is None or nxt is None:
+            return -0.2
+        if prev == nxt:
+            return 0.05
+        distance = abs(prev - nxt)
+        return -distance / (jump_scale + tiny)
+
+    # Precompute transition matrix for efficiency.
+    transition_matrix = np.zeros((len(states), len(states)), dtype=float)
+    for i, prev_state in enumerate(states):
+        for j, next_state in enumerate(states):
+            transition_matrix[i, j] = transition_cost(prev_state, next_state)
+
+    # Viterbi decoding.
+    log_probs = np.full((len(states), len(timeline)), -np.inf, dtype=float)
+    backptr = np.full((len(states), len(timeline)), -1, dtype=int)
+
+    log_probs[:, 0] = emissions[:, 0]
+    for t_idx in range(1, len(timeline)):
+        for curr_idx in range(len(states)):
+            transition_candidates = log_probs[:, t_idx - 1] + transition_matrix[:, curr_idx]
+            best_prev = int(np.argmax(transition_candidates))
+            log_probs[curr_idx, t_idx] = transition_candidates[best_prev] + emissions[curr_idx, t_idx]
+            backptr[curr_idx, t_idx] = best_prev
+
+    best_last_state = int(np.argmax(log_probs[:, -1]))
+    best_path: List[int | None] = [None] * len(timeline)
+    best_path[-1] = states[best_last_state]
+    for t_idx in range(len(timeline) - 1, 0, -1):
+        best_last_state = backptr[best_last_state, t_idx]
+        best_path[t_idx - 1] = states[best_last_state]
+
+    # Convert the best path into contiguous segments.
+    segments: List[Tuple[int | None, int, int]] = []
+    seg_start = 0
+    for idx in range(1, len(best_path)):
+        if best_path[idx] != best_path[seg_start]:
+            segments.append((best_path[seg_start], seg_start, idx))
+            seg_start = idx
+    segments.append((best_path[seg_start], seg_start, len(best_path)))
+
+    # Enforce minimum duration by merging with neighbors.
+    def segment_duration(start: int, end: int) -> float:
+        return (times[end - 1] - times[start]) + frame_duration
+
+    i = 0
+    while i < len(segments):
+        state, start_idx, end_idx = segments[i]
+        duration = segment_duration(start_idx, end_idx)
+        if duration >= min_duration or len(segments) == 1:
+            i += 1
+            continue
+
+        if i == 0:
+            segments[i + 1] = (segments[i + 1][0], start_idx, segments[i + 1][2])
+        elif i == len(segments) - 1:
+            prev_state, prev_start, prev_end = segments[i - 1]
+            segments[i - 1] = (prev_state, prev_start, end_idx)
+        else:
+            prev_state, prev_start, prev_end = segments[i - 1]
+            next_state, next_start, next_end = segments[i + 1]
+            if prev_state == state:
+                segments[i - 1] = (prev_state, prev_start, end_idx)
+            elif next_state == state:
+                segments[i + 1] = (next_state, start_idx, next_end)
+            else:
+                # Merge with the closer pitch neighbor when possible.
+                prev_dist = abs(prev_state - state) if prev_state is not None and state is not None else np.inf
+                next_dist = abs(next_state - state) if next_state is not None and state is not None else np.inf
+                if prev_dist <= next_dist:
+                    segments[i - 1] = (prev_state, prev_start, end_idx)
+                else:
+                    segments[i + 1] = (next_state, start_idx, next_end)
+        segments.pop(i)
+
+    # Optionally enforce a maximum duration by splitting long notes.
+    if max_duration is not None and max_duration > 0:
+        split_segments: List[Tuple[int | None, int, int]] = []
+        for state, start_idx, end_idx in segments:
+            duration = segment_duration(start_idx, end_idx)
+            if state is None or duration <= max_duration:
+                split_segments.append((state, start_idx, end_idx))
+                continue
+
+            max_frames = int(np.ceil(max_duration / frame_duration))
+            current_start = start_idx
+            while current_start < end_idx:
+                current_end = min(end_idx, current_start + max_frames)
+                split_segments.append((state, current_start, current_end))
+                current_start = current_end
+        segments = split_segments
+
+    # Convert segments into notes while handling gap-aware merging.
+    candidate_notes: List[NoteEvent] = []
+    for state, start_idx, end_idx in segments:
+        if state is None:
+            continue
+        start_time = times[start_idx]
+        end_time = times[end_idx - 1] + frame_duration
         duration = end_time - start_time
-        if duration >= min_duration and midi_values:
-            midi_note = int(round(float(np.median(midi_values))))
-            pitch_hz = float(librosa.midi_to_hz(midi_note))
-            confidence = float(np.mean(conf_values)) if conf_values else 0.0
-            notes.append(
-                NoteEvent(
-                    start_sec=start_time,
-                    end_sec=end_time,
-                    midi_note=midi_note,
-                    pitch_hz=pitch_hz,
-                    confidence=confidence,
-                )
+        if duration < min_duration:
+            continue
+        midi_values = smoothed_midi[start_idx:end_idx]
+        midi_value = int(round(float(np.nanmedian(midi_values))))
+        pitch_hz = float(librosa.midi_to_hz(midi_value))
+        confidence = float(np.mean(conf_obs[start_idx:end_idx]))
+        candidate_notes.append(
+            NoteEvent(
+                start_sec=float(start_time),
+                end_sec=float(end_time),
+                midi_note=midi_value,
+                pitch_hz=pitch_hz,
+                confidence=confidence,
             )
+        )
 
-    return notes
+    if not candidate_notes:
+        return []
+
+    candidate_notes.sort(key=lambda n: n.start_sec)
+    merged_notes: List[NoteEvent] = []
+    merged_notes.append(candidate_notes[0])
+    for note in candidate_notes[1:]:
+        last = merged_notes[-1]
+        gap = note.start_sec - last.end_sec
+        if gap < rest_threshold and note.midi_note == last.midi_note:
+            merged_notes[-1] = NoteEvent(
+                start_sec=last.start_sec,
+                end_sec=note.end_sec,
+                midi_note=last.midi_note,
+                pitch_hz=float(librosa.midi_to_hz(last.midi_note)),
+                confidence=float((last.confidence + note.confidence) / 2.0),
+            )
+        else:
+            merged_notes.append(note)
+
+    return merged_notes
 
 
 def extract_features(
@@ -352,7 +482,9 @@ def extract_features(
         timeline,
         frame_duration=frame_duration,
         min_duration=0.06,
-        pitch_jump=0.6,
+        max_duration=8.0,
+        rest_threshold=0.08,
+        median_window=5,
     )
 
     chords: List[ChordEvent] = []
