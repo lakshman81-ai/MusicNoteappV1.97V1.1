@@ -45,6 +45,16 @@ class BenchmarkCase:
         ).strip("_")
 
 
+@dataclass
+class MatchMetrics:
+    precision: float
+    recall: float
+    f1: float
+    matched: int
+    reference_total: int
+    predicted_total: int
+
+
 def extract_notes(score_path: Path) -> List[NoteTuple]:
     score = converter.parse(str(score_path))
     notes: List[NoteTuple] = []
@@ -109,7 +119,12 @@ def match_accuracy(
 
 
 def run_single_case(
-    case: BenchmarkCase, *, use_crepe: bool = False, output_dir: Path | None = None
+    case: BenchmarkCase,
+    *,
+    use_crepe: bool = False,
+    output_dir: Path | None = None,
+    tempo_override: float | None = None,
+    beat_times_override: List[float] | None = None,
 ) -> Dict[str, float | int | str]:
     """Run transcription for a single audio/reference pair."""
 
@@ -124,7 +139,12 @@ def run_single_case(
     print(f"\n🎧 Audio: {case.audio_path}")
     print(f"🎼 Reference: {case.reference_path}")
 
-    result = transcribe_audio_pipeline(str(case.audio_path), use_crepe=use_crepe)
+    result = transcribe_audio_pipeline(
+        str(case.audio_path),
+        use_crepe=use_crepe,
+        tempo_override=tempo_override,
+        beat_times_override=beat_times_override,
+    )
     musicxml_text = result["musicxml"]
     midi_bytes: bytes = result["midi_bytes"]
 
@@ -193,18 +213,38 @@ def run_suite(
     output_dir: Path | None = None,
     threshold: float = 0.75,
     report_path: Path | None = None,
+    tempo_override: float | None = None,
+    beat_times_override: List[float] | None = None,
 ) -> int:
     output_dir = output_dir or Path("benchmarks_results")
     output_dir.mkdir(exist_ok=True)
 
-    summaries = [run_single_case(case, use_crepe=use_crepe, output_dir=output_dir) for case in cases]
+    summaries = [
+        run_single_case(
+            case,
+            use_crepe=use_crepe,
+            output_dir=output_dir,
+            tempo_override=tempo_override,
+            beat_times_override=beat_times_override,
+        )
+        for case in cases
+    ]
 
-    avg_pitch = sum(item["pitch_accuracy"] for item in summaries) / len(summaries)
-    avg_rhythm = sum(item["rhythm_accuracy"] for item in summaries) / len(summaries)
+    def _avg(key: str) -> float:
+        return sum(float(item[key]) for item in summaries) / float(len(summaries))
+
+    avg_pitch_f1 = _avg("pitch_f1")
+    avg_rhythm_f1 = _avg("rhythm_f1")
 
     suite_summary = {
-        "average_pitch_accuracy": avg_pitch,
-        "average_rhythm_accuracy": avg_rhythm,
+        "average_pitch_accuracy": avg_pitch_f1,
+        "average_rhythm_accuracy": avg_rhythm_f1,
+        "average_pitch_precision": _avg("pitch_precision"),
+        "average_pitch_recall": _avg("pitch_recall"),
+        "average_pitch_f1": avg_pitch_f1,
+        "average_rhythm_precision": _avg("rhythm_precision"),
+        "average_rhythm_recall": _avg("rhythm_recall"),
+        "average_rhythm_f1": avg_rhythm_f1,
         "threshold": threshold,
         "cases": summaries,
     }
@@ -213,15 +253,25 @@ def run_suite(
     aggregate_path.write_text(json.dumps(suite_summary, indent=2), encoding="utf-8")
 
     print("\n=== SUITE SUMMARY ===")
-    print(f"Avg pitch accuracy:  {avg_pitch * 100:.1f}%")
-    print(f"Avg rhythm accuracy: {avg_rhythm * 100:.1f}% (±0.25 beats)")
+    print(
+        "Avg pitch precision/recall/F1: "
+        f"{suite_summary['average_pitch_precision']*100:.1f}% / "
+        f"{suite_summary['average_pitch_recall']*100:.1f}% / "
+        f"{avg_pitch_f1*100:.1f}%"
+    )
+    print(
+        "Avg rhythm precision/recall/F1: "
+        f"{suite_summary['average_rhythm_precision']*100:.1f}% / "
+        f"{suite_summary['average_rhythm_recall']*100:.1f}% / "
+        f"{avg_rhythm_f1*100:.1f}% (±0.25 beats)"
+    )
     print(f"Aggregate summary saved to: {aggregate_path}")
 
     if report_path:
         write_markdown_report(suite_summary, report_path)
         print(f"Markdown report saved to: {report_path}")
 
-    if avg_pitch < threshold or avg_rhythm < threshold:
+    if avg_pitch_f1 < threshold or avg_rhythm_f1 < threshold:
         print(
             f"Suite accuracy below threshold ({threshold*100:.0f}%). "
             "Failing with non-zero exit code."
@@ -237,8 +287,8 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
         "",
         "Aggregated pitch and rhythm accuracy measured with `benchmarks/benchmark_local_file.py --suite`.",
         "",
-        "| Scenario | Audio | Reference | Pitch accuracy | Rhythm accuracy (±0.25 beat) | Notes |",
-        "|----------|-------|-----------|----------------|-------------------------------|-------|",
+        "| Scenario | Audio | Reference | Pitch P / R / F1 | Rhythm P / R / F1 (±0.25 beat) | Notes |",
+        "|----------|-------|-----------|------------------|---------------------------------|-------|",
     ]
 
     rows = []
@@ -295,8 +345,8 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
                     str(case["scenario"]),
                     Path(str(case["audio"])).name,
                     Path(str(case["reference"])).as_posix(),
-                    f"{pitch_pct:.1f}%",
-                    f"{rhythm_pct:.1f}%",
+                    f"{pitch_prf[0]:.1f}% / {pitch_prf[1]:.1f}% / {pitch_prf[2]:.1f}%",
+                    f"{rhythm_prf[0]:.1f}% / {rhythm_prf[1]:.1f}% / {rhythm_prf[2]:.1f}%",
                     notes,
                 ]
             )
@@ -306,8 +356,18 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
     footer = [
         "",
         "## Averages",
-        f"- Pitch accuracy: {float(suite_summary['average_pitch_accuracy'])*100:.1f}%",
-        f"- Rhythm accuracy: {float(suite_summary['average_rhythm_accuracy'])*100:.1f}%",
+        (
+            "- Pitch: "
+            f"precision {float(suite_summary['average_pitch_precision'])*100:.1f}%, "
+            f"recall {float(suite_summary['average_pitch_recall'])*100:.1f}%, "
+            f"F1 {float(suite_summary['average_pitch_f1'])*100:.1f}%"
+        ),
+        (
+            "- Rhythm: "
+            f"precision {float(suite_summary['average_rhythm_precision'])*100:.1f}%, "
+            f"recall {float(suite_summary['average_rhythm_recall'])*100:.1f}%, "
+            f"F1 {float(suite_summary['average_rhythm_f1'])*100:.1f}%"
+        ),
         f"- Threshold: {float(suite_summary['threshold'])*100:.0f}%",
     ]
 
@@ -362,7 +422,18 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.75, help="Fail if average pitch or rhythm accuracy falls below this value")
     parser.add_argument("--output-dir", type=Path, default=Path("benchmarks_results"), help="Where to store predictions and summaries")
     parser.add_argument("--report", type=Path, default=REPO_ROOT / "benchmarks" / "results_accuracy.md", help="Path to write the markdown results table when running the suite")
+    parser.add_argument("--tempo-bpm", type=float, default=None, help="Override tempo (BPM) for quantization when beat tracking is unreliable")
+    parser.add_argument(
+        "--beat-times",
+        type=str,
+        default=None,
+        help="Comma-separated beat times in seconds to override the beat grid (e.g., '0,0.5,1.0,1.5')",
+    )
     args = parser.parse_args()
+
+    beat_times_override = None
+    if args.beat_times:
+        beat_times_override = [float(v) for v in args.beat_times.split(",") if v.strip()]
 
     if args.suite:
         cases = get_default_suite()
@@ -372,6 +443,8 @@ def main() -> None:
             output_dir=args.output_dir,
             threshold=args.threshold,
             report_path=args.report,
+            tempo_override=args.tempo_bpm,
+            beat_times_override=beat_times_override,
         )
         raise SystemExit(exit_code)
 
@@ -389,7 +462,13 @@ def main() -> None:
         reference_path=args.reference_path,
         scenario="ad-hoc",
     )
-    run_single_case(case, use_crepe=args.use_crepe, output_dir=args.output_dir)
+    run_single_case(
+        case,
+        use_crepe=args.use_crepe,
+        output_dir=args.output_dir,
+        tempo_override=args.tempo_bpm,
+        beat_times_override=beat_times_override,
+    )
 
 
 if __name__ == "__main__":

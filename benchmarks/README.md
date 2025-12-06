@@ -33,23 +33,26 @@ Add new scenarios by creating additional numbered folders that follow the same p
    Use this when you only want timing and MIDI/MusicXML exports without accuracy scoring.
 3. **Accuracy for a single audio/reference pair:**
    ```bash
-   python benchmarks/benchmark_local_file.py benchmarks/audio/Simple\ Scale\ –\ C\ Major.mp3 benchmarks/reference/c_major_scale.musicxml --use-crepe
+   python benchmarks/benchmark_local_file.py benchmarks/audio/Simple\ Scale\ –\ C\ Major.mp3 benchmarks/reference/c_major_scale.musicxml --use-crepe --tempo-bpm 92
    ```
-   Outputs MusicXML/MIDI predictions plus a JSON summary (note counts, pitch/rhythm accuracy) in `benchmarks_results/`.
+   Outputs MusicXML/MIDI predictions plus a JSON summary (note counts, pitch/rhythm precision/recall/F1) in `benchmarks_results/`.
 4. **Full suite accuracy snapshot:**
    ```bash
    python benchmarks/benchmark_local_file.py --suite --use-crepe --threshold 0.75 \
      --output-dir benchmarks_results \
-     --report benchmarks/results_accuracy.md
+     --report benchmarks/results_accuracy.md \
+     --beat-times 0,0.48,0.96,1.44
    ```
    - `--use-crepe` enables CREPE pitch tracking when installed.
+   - `--tempo-bpm` pins the quantization tempo, bypassing the 120 BPM fallback when beat tracking is unreliable.
+   - `--beat-times` supplies a comma-separated beat grid (seconds) to skip beat tracking entirely; leave blank to auto-detect.
    - `--threshold` fails the command if average pitch or rhythm accuracy falls below the given fraction (default 0.75), which is useful for CI.
    - `--output-dir` collects per-clip `*_pred.musicxml`, `*_pred.mid`, and `*_summary.json` artifacts.
    - `--report` writes a Markdown rollup to `benchmarks/results_accuracy.md`.
 
 ### Interpreting results
-- **Pitch accuracy:** percent of reference notes matched on MIDI pitch and onset within ±0.25 beat.
-- **Rhythm accuracy:** also requires duration match within ±0.25 beat.
+- **Pitch precision/recall/F1:** matches on MIDI pitch and onset within ±0.25 beat; false positives reduce precision and F1.
+- **Rhythm precision/recall/F1:** also requires duration match within ±0.25 beat.
 - **JSON summaries:** include the number of reference vs. predicted notes to quickly spot over/under-quantization.
 - **MusicXML/MIDI exports:** open these alongside the reference to listen for drift or missing notes; filenames mirror the audio slug (e.g., `simple_scale_–_c_major_pred.musicxml`).
 

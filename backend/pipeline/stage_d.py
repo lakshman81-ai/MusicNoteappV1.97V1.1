@@ -30,11 +30,26 @@ def _determine_subdivisions(tempo_bpm: float) -> int:
     return max(1, subdivisions)
 
 
-def _estimate_tempo_and_beats(meta) -> Tuple[float, List[float]]:
-    tempo_guess = meta.tempo_bpm or 120.0
+def _estimate_tempo_and_beats(
+    meta, tempo_override: float | None = None, beat_times_override: List[float] | None = None
+) -> Tuple[float, List[float]]:
+    explicit_tempo = tempo_override or getattr(meta, "tempo_override", None)
+    explicit_beats = beat_times_override or getattr(meta, "beat_times_override", None)
+    tempo_guess = explicit_tempo or meta.tempo_bpm or 120.0
     y = getattr(meta, "preprocessed_audio", None)
     sr = getattr(meta, "sample_rate", None)
     hop_length = getattr(meta, "hop_length", 256) or 256
+
+    if explicit_beats:
+        beats_sorted = sorted(float(b) for b in explicit_beats)
+        if explicit_tempo is None and len(beats_sorted) >= 2:
+            diffs = np.diff(np.asarray(beats_sorted))
+            positive_diffs = diffs[diffs > 0]
+            if positive_diffs.size:
+                tempo_guess = 60.0 / float(np.median(positive_diffs))
+        if tempo_guess <= 0:
+            tempo_guess = meta.tempo_bpm or 120.0
+        return tempo_guess, beats_sorted
 
     if y is None or sr is None:
         return tempo_guess, []
@@ -42,7 +57,10 @@ def _estimate_tempo_and_beats(meta) -> Tuple[float, List[float]]:
     try:
         tempo_bpm, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
         beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
-        return float(tempo_bpm), beat_times.tolist()
+        tempo_bpm = float(tempo_bpm)
+        if tempo_bpm <= 0:
+            tempo_bpm = tempo_guess
+        return tempo_bpm, beat_times.tolist()
     except Exception:
         return tempo_guess, []
 
@@ -135,11 +153,18 @@ def _build_score(events: List[NoteEvent], tempo_bpm: float, time_signature: str,
     return score
 
 
-def quantize_and_render(events: List[NoteEvent], analysis_data: AnalysisData) -> str:
+def quantize_and_render(
+    events: List[NoteEvent],
+    analysis_data: AnalysisData,
+    tempo_override: float | None = None,
+    beat_times_override: List[float] | None = None,
+) -> str:
     """Quantize NoteEvents and render them to a MusicXML string."""
 
     meta = analysis_data.meta
-    tempo_bpm, beat_times = _estimate_tempo_and_beats(meta)
+    tempo_bpm, beat_times = _estimate_tempo_and_beats(
+        meta, tempo_override=tempo_override, beat_times_override=beat_times_override
+    )
     meta.tempo_bpm = tempo_bpm
     time_signature = meta.time_signature or "4/4"
 
