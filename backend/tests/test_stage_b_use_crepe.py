@@ -27,7 +27,8 @@ class ExtractFeaturesCrepeToggleTests(unittest.TestCase):
         ), patch(
             "backend.pipeline.stage_b._harmonic_summation_refine", side_effect=lambda *_args, **_kwargs: np.asarray([440.0])
         ), patch(
-            "backend.pipeline.stage_b._smooth_midi_with_voicing", side_effect=lambda f0, _probs: f0
+            "backend.pipeline.stage_b._smooth_midi_with_voicing",
+            side_effect=lambda f0, _probs, **_kwargs: f0,
         ), patch(
             "backend.pipeline.stage_b._build_timeline",
             return_value=[stage_b.FramePitch(time=0.0, pitch_hz=440.0, midi=69, confidence=0.9)],
