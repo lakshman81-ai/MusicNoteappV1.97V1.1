@@ -338,6 +338,16 @@ def run_suite(
 
 
 def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -> None:
+    def _prf_from_counts(matched: int, missed: int, extra: int) -> tuple[float, float, float]:
+        precision_den = matched + extra
+        recall_den = matched + missed
+
+        precision = matched / precision_den if precision_den else 0.0
+        recall = matched / recall_den if recall_den else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+
+        return precision * 100, recall * 100, f1 * 100
+
     header = [
         "# Benchmark accuracy snapshot",
         "",
