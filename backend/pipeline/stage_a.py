@@ -38,6 +38,21 @@ def _to_mono(y: np.ndarray) -> np.ndarray:
     return np.mean(y, axis=1, dtype=np.float32)
 
 
+def _trim_silence(y: np.ndarray, top_db: float = 40.0) -> np.ndarray:
+    """Trim leading and trailing silence using an energy threshold."""
+
+    try:
+        non_silent_indices = librosa.effects.split(y, top_db=top_db)
+    except Exception:
+        return y.astype(np.float32)
+
+    if non_silent_indices.size == 0:
+        return np.array([], dtype=np.float32)
+
+    start, end = non_silent_indices[0][0], non_silent_indices[-1][1]
+    return y[start:end].astype(np.float32)
+
+
 def _resample(y: np.ndarray, sr: int, target_sr: int) -> Tuple[np.ndarray, int]:
     """Resample waveform to the target sample rate."""
 
@@ -79,7 +94,16 @@ def load_and_preprocess(
         raise ValueError("Loaded audio is empty")
 
     y_mono = _to_mono(y)
-    y_resampled, sr_out = _resample(y_mono, original_sr, target_sr)
+    y_trimmed = _trim_silence(y_mono, top_db=40.0)
+
+    if y_trimmed.size == 0:
+        raise ValueError("Audio contains only silence after trimming")
+
+    duration_after_trim = float(len(y_trimmed) / original_sr)
+    if duration_after_trim < 0.5:
+        raise ValueError("Audio duration after trimming is below 0.5 seconds")
+
+    y_resampled, sr_out = _resample(y_trimmed, original_sr, target_sr)
     y_norm, loudness = _normalize_loudness(y_resampled, sr_out)
 
     duration_sec = float(len(y_norm) / sr_out)
