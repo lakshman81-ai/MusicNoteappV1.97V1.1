@@ -3,6 +3,109 @@ import { audioEngine } from './audioEngine';
 import { NoteEvent, ChordEvent, AnalysisDataLite, TranscriptionMeta } from '../types';
 import { detectChords } from '../utils/chordDetection';
 
+const TARGET_LOUDNESS_DB = -20;
+const MIN_DURATION_SEC = 0.5;
+const ENERGY_FLOOR = 1e-6;
+
+const computeRms = (data: Float32Array): number => {
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        sum += v * v;
+    }
+    return data.length ? Math.sqrt(sum / data.length) : 0;
+};
+
+const computePeak = (data: Float32Array): number => {
+    let peak = 0;
+    for (let i = 0; i < data.length; i++) {
+        peak = Math.max(peak, Math.abs(data[i]));
+    }
+    return peak;
+};
+
+const prepareAudioBuffer = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
+    if (!audioBuffer || !audioBuffer.length || audioBuffer.duration <= 0) {
+        throw new Error('Invalid or empty audio buffer');
+    }
+
+    const targetSampleRate = audioEngine.sampleRate || 44100;
+    const originalSampleRate = audioBuffer.sampleRate;
+    const channelCount = audioBuffer.numberOfChannels;
+    const length = audioBuffer.length;
+
+    const monoData = new Float32Array(length);
+    for (let channel = 0; channel < channelCount; channel++) {
+        const channelData = audioBuffer.getChannelData(channel);
+        for (let i = 0; i < length; i++) {
+            monoData[i] += channelData[i] / channelCount;
+        }
+    }
+
+    for (let i = 0; i < monoData.length; i++) {
+        if (!isFinite(monoData[i])) {
+            throw new Error('Corrupted audio data encountered');
+        }
+    }
+
+    const rms = computeRms(monoData);
+    const silenceThreshold = Math.max(ENERGY_FLOOR, rms * 0.05);
+
+    let start = 0;
+    while (start < monoData.length && Math.abs(monoData[start]) < silenceThreshold) start++;
+    let end = monoData.length - 1;
+    while (end > start && Math.abs(monoData[end]) < silenceThreshold) end--;
+
+    const trimmed = monoData.slice(start, end + 1);
+    if (trimmed.length === 0) {
+        throw new Error('Audio is silent or below threshold');
+    }
+
+    const durationSec = trimmed.length / originalSampleRate;
+    if (durationSec < MIN_DURATION_SEC) {
+        throw new Error('Audio clip too short for analysis');
+    }
+
+    const offlineContext = new OfflineAudioContext(
+        1,
+        Math.ceil((trimmed.length / originalSampleRate) * targetSampleRate),
+        targetSampleRate
+    );
+
+    const trimmedBuffer = new AudioBuffer({ length: trimmed.length, numberOfChannels: 1, sampleRate: originalSampleRate });
+    trimmedBuffer.copyToChannel(trimmed, 0);
+
+    const source = offlineContext.createBufferSource();
+    source.buffer = trimmedBuffer;
+    source.connect(offlineContext.destination);
+    source.start(0);
+
+    const resampledBuffer = await offlineContext.startRendering();
+    const resampledData = resampledBuffer.getChannelData(0);
+
+    const resampledRms = computeRms(resampledData);
+    const resampledPeak = computePeak(resampledData);
+    if (resampledRms === 0 || resampledPeak === 0) {
+        throw new Error('Audio lacks usable signal after preprocessing');
+    }
+
+    const targetLinearRms = Math.pow(10, TARGET_LOUDNESS_DB / 20);
+    const gain = Math.min(
+        targetLinearRms / Math.max(resampledRms, ENERGY_FLOOR),
+        resampledPeak > 0 ? 0.999 / resampledPeak : 1
+    );
+
+    for (let i = 0; i < resampledData.length; i++) {
+        resampledData[i] *= gain;
+    }
+
+    if (resampledBuffer.duration < MIN_DURATION_SEC) {
+        throw new Error('Audio clip too short after preprocessing');
+    }
+
+    return resampledBuffer;
+};
+
 // Helper to format Harmony XML
 const getMusicXMLHarmony = (chord: ChordEvent): string => {
     let rootStep = chord.root.charAt(0);
@@ -234,8 +337,9 @@ export const TranscriptionService = {
         // Use a fresh context for decoding to avoid state issues
         const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
         const arrayBuffer = await audioBlob.arrayBuffer();
-        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-        
+        const decodedBuffer = await ctx.decodeAudioData(arrayBuffer);
+        const audioBuffer = await prepareAudioBuffer(decodedBuffer);
+
         // Analyze audio to get notes using the existing engine logic
         const preQuantizedNotes = audioEngine.analyzeAudioSegment(audioBuffer, 0, audioBuffer.duration);
 
