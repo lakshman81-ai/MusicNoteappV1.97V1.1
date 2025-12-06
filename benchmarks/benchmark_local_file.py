@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 import sys
 
+import librosa
 from music21 import converter, note as m21note
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -118,6 +119,47 @@ def match_accuracy(
     )
 
 
+def get_audio_metadata(path: Path) -> tuple[float, int, int]:
+    """Return (duration_seconds, sample_rate, channel_count) for an audio file."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Audio file not found: {path}")
+
+    # Load a short snippet (or header info) to infer sample rate and channels without
+    # decoding the full file.
+    y, sr = librosa.load(str(path), sr=None, mono=False, duration=1.0)
+    channels = int(y.shape[0]) if y.ndim > 1 else 1
+    duration_seconds = float(librosa.get_duration(filename=str(path)))
+    return duration_seconds, int(sr), channels
+
+
+def format_audio_note(sample_rate: int, channels: int, duration_seconds: float) -> str:
+    """Render a concise metadata snippet like '44.1kHz stereo, 18s'."""
+
+    sr_khz = sample_rate / 1000
+    channel_label = "mono" if channels == 1 else "stereo" if channels == 2 else f"{channels}-channel"
+    duration_label = f"{round(duration_seconds)}s"
+    return f"{sr_khz:.1f}kHz {channel_label}, {duration_label}"
+
+
+def calculate_prf(stats: MatchStats) -> MatchMetrics:
+    predicted_total = stats.matched + stats.extra
+    reference_total = stats.matched + stats.missed
+
+    precision = stats.matched / predicted_total if predicted_total else 0.0
+    recall = stats.matched / reference_total if reference_total else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+
+    return MatchMetrics(
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        matched=stats.matched,
+        reference_total=reference_total,
+        predicted_total=predicted_total,
+    )
+
+
 def run_single_case(
     case: BenchmarkCase,
     *,
@@ -135,6 +177,8 @@ def run_single_case(
         raise FileNotFoundError(f"Audio file not found: {case.audio_path}")
     if not case.reference_path.exists():
         raise FileNotFoundError(f"Reference file not found: {case.reference_path}")
+
+    duration_seconds, sample_rate, channels = get_audio_metadata(case.audio_path)
 
     print(f"\n🎧 Audio: {case.audio_path}")
     print(f"🎼 Reference: {case.reference_path}")
@@ -159,21 +203,33 @@ def run_single_case(
 
     pitch_stats = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=False)
     rhythm_stats = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=True)
+    pitch_metrics = calculate_prf(pitch_stats)
+    rhythm_metrics = calculate_prf(rhythm_stats)
 
     summary: Dict[str, float | int | str] = {
         "name": case.name,
         "scenario": case.scenario,
         "audio": str(case.audio_path),
         "reference": str(case.reference_path),
+        "audio_duration_seconds": duration_seconds,
+        "audio_sample_rate": sample_rate,
+        "audio_channels": channels,
+        "audio_note": format_audio_note(sample_rate, channels, duration_seconds),
         "reference_notes": len(ref_notes),
         "predicted_notes": len(pred_notes),
         "pitch_accuracy": pitch_stats.accuracy,
+        "pitch_precision": pitch_metrics.precision,
+        "pitch_recall": pitch_metrics.recall,
+        "pitch_f1": pitch_metrics.f1,
         "pitch_matched": pitch_stats.matched,
         "pitch_missed": pitch_stats.missed,
         "pitch_extra": pitch_stats.extra,
         "pitch_missed_onsets_sample": pitch_stats.missed_onsets_sample,
         "pitch_extra_onsets_sample": pitch_stats.extra_onsets_sample,
         "rhythm_accuracy": rhythm_stats.accuracy,
+        "rhythm_precision": rhythm_metrics.precision,
+        "rhythm_recall": rhythm_metrics.recall,
+        "rhythm_f1": rhythm_metrics.f1,
         "rhythm_matched": rhythm_stats.matched,
         "rhythm_missed": rhythm_stats.missed,
         "rhythm_extra": rhythm_stats.extra,
@@ -294,26 +350,21 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
     rows = []
     threshold = float(suite_summary.get("threshold", 0.75))
     for case in suite_summary.get("cases", []):
-        pitch_precision = float(case.get("pitch_precision", case.get("pitch_accuracy", 0.0))) * 100
-        pitch_recall = float(case.get("pitch_recall", case.get("pitch_accuracy", 0.0))) * 100
-        pitch_f1 = float(case.get("pitch_f1", case.get("pitch_accuracy", 0.0))) * 100
-        rhythm_precision = float(case.get("rhythm_precision", case.get("rhythm_accuracy", 0.0))) * 100
-        rhythm_recall = float(case.get("rhythm_recall", case.get("rhythm_accuracy", 0.0))) * 100
-        rhythm_f1 = float(case.get("rhythm_f1", case.get("rhythm_accuracy", 0.0))) * 100
-        pitch_prf = (pitch_precision, pitch_recall, pitch_f1)
-        rhythm_prf = (rhythm_precision, rhythm_recall, rhythm_f1)
-
-        pitch_pct = pitch_f1
-        rhythm_pct = rhythm_f1
         pitch_missed = case.get("pitch_missed", 0)
         pitch_extra = case.get("pitch_extra", 0)
         rhythm_missed = case.get("rhythm_missed", 0)
         rhythm_extra = case.get("rhythm_extra", 0)
 
-        predicted_notes = int(case.get("predicted_notes", 0))
-        reference_notes = int(case.get("reference_notes", 0))
-        note_delta = predicted_notes - reference_notes
-        note_delta_pct = (note_delta / reference_notes) if reference_notes else None
+        pitch_prf = (
+            float(case.get("pitch_precision", 0.0)) * 100,
+            float(case.get("pitch_recall", 0.0)) * 100,
+            float(case.get("pitch_f1", 0.0)) * 100,
+        )
+        rhythm_prf = (
+            float(case.get("rhythm_precision", 0.0)) * 100,
+            float(case.get("rhythm_recall", 0.0)) * 100,
+            float(case.get("rhythm_f1", 0.0)) * 100,
+        )
 
         pitch_samples = []
         if case.get("pitch_missed_onsets_sample"):
@@ -344,29 +395,16 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
         if rhythm_samples:
             samples_note.append("Rhythm " + "; ".join(rhythm_samples))
 
-        alerts = []
-        if pitch_pct / 100 < threshold:
-            alerts.append(f"Pitch below threshold ({pitch_pct:.1f}% < {threshold*100:.0f}%).")
-        if rhythm_pct / 100 < threshold:
-            alerts.append(f"Rhythm below threshold ({rhythm_pct:.1f}% < {threshold*100:.0f}%).")
+        notes_parts = [
+            str(case.get("audio_note", "")),
+            f"{case['predicted_notes']} predicted vs {case['reference_notes']} reference notes.",
+            pitch_note + ".",
+            rhythm_note + ".",
+            " ".join(samples_note),
+            f"Files: `{Path(case['predicted_musicxml']).name}` / `{Path(case['predicted_midi']).name}`.",
+        ]
 
-        if note_delta_pct is not None and abs(note_delta_pct) >= 0.10:
-            direction = "over-quantized" if note_delta_pct > 0 else "under-quantized"
-            severity = "Significant " if abs(note_delta_pct) >= 0.20 else ""
-            alerts.append(
-                f"{severity}note count {note_delta:+d} ({note_delta_pct*100:.1f}%) — possible {direction}."
-            )
-
-        notes = " ".join(
-            [
-                f"{predicted_notes} predicted vs {reference_notes} reference notes.",
-                pitch_note + ".",
-                rhythm_note + ".",
-                "Alerts: " + " ".join(alerts) if alerts else "",
-                " ".join(samples_note),
-                f"Files: `{Path(case['predicted_musicxml']).name}` / `{Path(case['predicted_midi']).name}`.",
-            ]
-        ).strip()
+        notes = " ".join(part for part in notes_parts if part).strip()
         rows.append(
             "| "
             + " | ".join(
