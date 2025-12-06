@@ -500,21 +500,25 @@ export class AudioEngine {
       };
   }
 
-  public cleanupAndQuantize(notes: NoteEvent[]): NoteEvent[] {
+  public cleanupAndQuantize(notes: NoteEvent[], tempoBpm: number = 120): NoteEvent[] {
       if (notes.length === 0) return [];
+
+      const secondsPerBeat = 60 / tempoBpm;
+      const gridSize = secondsPerBeat / 4; // 1/16 note resolution
+      const minDuration = gridSize; // At least one grid unit
+      const mergeGap = gridSize / 2; // 1/32 note gaps are merged
 
       let cleanNotes = notes.filter(n => n.duration > 0.08);
 
-      const GRID_SIZE = 0.125; 
       cleanNotes = cleanNotes.map(n => {
-          const snappedStart = Math.round(n.start_time / GRID_SIZE) * GRID_SIZE;
-          let snappedDuration = Math.round(n.duration / GRID_SIZE) * GRID_SIZE;
-          if (snappedDuration < GRID_SIZE) snappedDuration = GRID_SIZE;
-          
+          const snappedStart = Math.max(0, Math.round(n.start_time / gridSize) * gridSize);
+          const snappedEnd = Math.round((n.start_time + n.duration) / gridSize) * gridSize;
+          const adjustedEnd = Math.max(snappedEnd, snappedStart + minDuration);
+
           return {
               ...n,
               start_time: snappedStart,
-              duration: snappedDuration
+              duration: adjustedEnd - snappedStart
           };
       });
 
@@ -525,21 +529,21 @@ export class AudioEngine {
 
       for (const note of cleanNotes) {
           const pitchKey = Math.round(note.midi_pitch);
-          
+
           if (activeNotes.has(pitchKey)) {
               const prevIdx = activeNotes.get(pitchKey)!;
               const prev = merged[prevIdx];
-              
+
               const gap = note.start_time - (prev.start_time + prev.duration);
-              
-              if (gap < 0.15) {
+
+              if (gap < mergeGap) {
                   const newEnd = Math.max(prev.start_time + prev.duration, note.start_time + note.duration);
                   prev.duration = newEnd - prev.start_time;
                   prev.confidence = Math.max(prev.confidence, note.confidence);
-                  continue; 
+                  continue;
               }
           }
-          
+
           merged.push(note);
           activeNotes.set(pitchKey, merged.length - 1);
       }
