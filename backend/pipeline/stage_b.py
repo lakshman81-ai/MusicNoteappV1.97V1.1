@@ -25,6 +25,8 @@ def _pitch_with_pyin(
     hop_length: int,
     fmin: float,
     fmax: float,
+    min_voiced_confidence: float = 0.1,
+    unvoiced_confidence: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     f0, voiced_flag, voiced_probs = librosa.pyin(
         y,
@@ -33,6 +35,12 @@ def _pitch_with_pyin(
         sr=sr,
         frame_length=2048,
         hop_length=hop_length,
+    )
+    voiced_probs = np.nan_to_num(voiced_probs, nan=0.0)
+    min_voiced_confidence = max(0.0, min_voiced_confidence)
+    voiced_probs = np.clip(voiced_probs, 0.0, 1.0)
+    voiced_probs = np.where(
+        voiced_flag, np.maximum(voiced_probs, min_voiced_confidence), unvoiced_confidence
     )
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
     return times, f0, voiced_flag, voiced_probs
@@ -65,6 +73,7 @@ def _pitch_with_crepe(
     hop_length: int,
     fmin: float,
     fmax: float,
+    voiced_threshold: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     crepe = importlib.import_module("crepe")
     step_size_ms = hop_length * 1000.0 / sr
@@ -78,7 +87,8 @@ def _pitch_with_crepe(
     time, frequency, confidence, _ = crepe.predict(
         y_resampled, sr_used, step_size=step_size_ms, viterbi=True
     )
-    voiced_flag = confidence > 0.3
+    voiced_threshold = max(0.0, voiced_threshold)
+    voiced_flag = confidence >= voiced_threshold
     return time.astype(float), frequency.astype(float), voiced_flag, confidence.astype(float)
 
 
@@ -160,20 +170,25 @@ def _smooth_midi_with_voicing(
     f0: np.ndarray,
     voiced_probs: np.ndarray,
     prob_threshold: float = 0.45,
-    window: int = 3,
+    smoothing_window: int = 13,
 ) -> np.ndarray:
+    if smoothing_window < 11 or smoothing_window > 17 or smoothing_window % 2 == 0:
+        raise ValueError("smoothing_window must be an odd integer between 11 and 17")
+
     midi = librosa.hz_to_midi(f0)
     midi = np.where(np.isfinite(midi), midi, np.nan)
     smoothed = midi.copy()
 
-    half = window // 2
+    voiced_mask = (voiced_probs >= prob_threshold) & np.isfinite(midi)
+
+    half = smoothing_window // 2
     for i in range(len(midi)):
-        if np.isnan(midi[i]) or voiced_probs[i] < prob_threshold:
+        if not voiced_mask[i]:
             continue
         start = max(0, i - half)
         end = min(len(midi), i + half + 1)
 
-        window_mask = (~np.isnan(midi[start:end])) & (voiced_probs[start:end] >= prob_threshold)
+        window_mask = voiced_mask[start:end]
         if not np.any(window_mask):
             continue
 
@@ -545,6 +560,12 @@ def extract_features(
     use_crepe: bool = False,
     velocity_humanization: float | None = None,
     velocity_seed: int | None = None,
+    crepe_voiced_threshold: float = 0.5,
+    pyin_min_confidence: float = 0.1,
+    voicing_on_threshold: float = 0.55,
+    voicing_off_threshold: float = 0.35,
+    smoothing_prob_threshold: float = 0.45,
+    smoothing_window: int = 13,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
     """
     Stage B: pitch tracking and simple note segmentation.
@@ -555,22 +576,39 @@ def extract_features(
     fmax = librosa.note_to_hz("C7")
 
     if use_crepe and _crepe_available():
-        times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(y, sr, hop_length)
+        times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(
+            y, sr, hop_length, fmin=fmin, fmax=fmax, voiced_threshold=crepe_voiced_threshold
+        )
     else:
         try:
             times, f0, voiced_flag, voiced_probs = _pitch_with_pyin(
-                y, sr, hop_length, fmin=fmin, fmax=fmax
+                y,
+                sr,
+                hop_length,
+                fmin=fmin,
+                fmax=fmax,
+                min_voiced_confidence=pyin_min_confidence,
             )
         except Exception:
             times, f0, voiced_flag, voiced_probs = _pitch_with_yin(
                 y, sr, hop_length, fmin=fmin, fmax=fmax
             )
 
-    voiced_mask = _apply_voicing_hysteresis(voiced_probs) & voiced_flag
+    voiced_mask = (
+        _apply_voicing_hysteresis(
+            voiced_probs, on_threshold=voicing_on_threshold, off_threshold=voicing_off_threshold
+        )
+        & voiced_flag
+    )
     refined_f0 = _harmonic_summation_refine(
         y, sr, hop_length, times, f0, voiced_mask, n_fft=2048, harmonics=4
     )
-    midi_smoothed = _smooth_midi_with_voicing(refined_f0, voiced_probs)
+    midi_smoothed = _smooth_midi_with_voicing(
+        refined_f0,
+        voiced_probs,
+        prob_threshold=smoothing_prob_threshold,
+        smoothing_window=smoothing_window,
+    )
 
     rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop_length)[0]
     alt_pitch_frames = _estimate_polyphonic_peaks(
