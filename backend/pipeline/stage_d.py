@@ -218,6 +218,12 @@ def quantize_and_render(
     meta.tempo_bpm = tempo_bpm
     time_signature = meta.time_signature or "4/4"
 
+    if not beat_times:
+        beat_duration = 60.0 / tempo_bpm
+        max_event_end = max((e.end_sec for e in events), default=meta.duration_sec or 0.0)
+        total_beats = max(1, int(math.ceil((max_event_end + beat_duration) / beat_duration)))
+        beat_times = [i * beat_duration for i in range(total_beats + 1)]
+
     _quantize_events(
         events, tempo_bpm=tempo_bpm, time_signature=time_signature, beat_times=beat_times, meta=meta
     )

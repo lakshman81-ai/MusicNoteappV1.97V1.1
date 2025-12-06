@@ -77,6 +77,17 @@ def _normalize_loudness(y: np.ndarray, sr: int) -> Tuple[np.ndarray, float | Non
         return y.astype(np.float32), None
 
 
+def _validate_signal(y: np.ndarray, rms_floor_db: float = -50.0, peak_floor: float = 1e-4) -> Tuple[float, float]:
+    peak = float(np.max(np.abs(y))) if y.size else 0.0
+    rms = float(np.sqrt(np.mean(np.square(y)))) if y.size else 0.0
+    rms_db = 20.0 * np.log10(max(rms, 1e-12))
+    if peak < peak_floor or rms_db < rms_floor_db:
+        raise ValueError(
+            f"Audio lacks usable signal after normalization (peak={peak:.5f}, rms_db={rms_db:.1f})"
+        )
+    return rms_db, peak
+
+
 def load_and_preprocess(
     audio_path: str,
     target_sr: int = DEFAULT_TARGET_SR,
@@ -106,6 +117,8 @@ def load_and_preprocess(
     y_resampled, sr_out = _resample(y_trimmed, original_sr, target_sr)
     y_norm, loudness = _normalize_loudness(y_resampled, sr_out)
 
+    rms_db, peak_level = _validate_signal(y_norm)
+
     duration_sec = float(len(y_norm) / sr_out)
 
     meta = MetaData(
@@ -118,6 +131,8 @@ def load_and_preprocess(
         tempo_bpm=None,
         detected_key=None,
         lufs=loudness,
+        signal_rms_db=rms_db,
+        peak_level=peak_level,
         preprocessed_audio=y_norm.astype(np.float32),
     )
 
