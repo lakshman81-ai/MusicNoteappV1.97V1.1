@@ -2,140 +2,89 @@ from __future__ import annotations
 
 from typing import List
 
-from music21 import (
-    stream,
-    note as m21note,
-    meter,
-    key as m21key,
-    tempo as m21tempo,
-    metadata as m21meta,
-)
+from music21 import key as m21key, meter, metadata as m21meta, note as m21note, stream, tempo
 from music21.musicxml.m21ToXml import GeneralObjectExporter
 
 from .models import NoteEvent, AnalysisData, VexflowLayout
 
 
-def _quantize_notes_to_beats(
-    events: List[NoteEvent],
-    tempo_bpm: float,
-    time_signature: str = "4/4",
-) -> None:
-    """
-    Fill note.measure, note.beat, note.duration_beats.
-    Very simple quantizer: snap start/end to nearest 1/16 note.
-    """
-    quarter_sec = 60.0 / tempo_bpm            # duration of 1 beat in seconds
-    sixteenth_sec = quarter_sec / 4.0         # 1/16 note
+SIXTEENTHS_PER_BEAT = 4.0
 
-    beats_per_measure = int(time_signature.split("/")[0])  # assumes x/4
 
-    for e in events:
-        # Quantize start & end in units of 1/16 notes
-        n_start = round(e.start_sec / sixteenth_sec)
-        n_end = round(e.end_sec / sixteenth_sec)
-        if n_end <= n_start:
-            n_end = n_start + 1  # ensure at least one 16th
+def _parse_time_signature(time_signature: str) -> int:
+    try:
+        numerator = int(time_signature.split("/")[0])
+        return max(numerator, 1)
+    except Exception:
+        return 4
 
-        # Convert to beats (beat = quarter note)
-        start_beats = n_start / 4.0
-        end_beats = n_end / 4.0
+
+def _quantize_events(events: List[NoteEvent], tempo_bpm: float, time_signature: str) -> None:
+    quarter_sec = 60.0 / tempo_bpm
+    sixteenth_sec = quarter_sec / SIXTEENTHS_PER_BEAT
+    beats_per_measure = _parse_time_signature(time_signature)
+
+    for event in events:
+        start_quant = round(event.start_sec / sixteenth_sec) * sixteenth_sec
+        end_quant = round(event.end_sec / sixteenth_sec) * sixteenth_sec
+        if end_quant <= start_quant:
+            end_quant = start_quant + sixteenth_sec
+
+        start_beats = start_quant / quarter_sec
+        end_beats = end_quant / quarter_sec
         duration_beats = end_beats - start_beats
 
         measure = int(start_beats // beats_per_measure) + 1
         beat_in_measure = (start_beats % beats_per_measure) + 1.0
 
-        e.measure = measure
-        e.beat = beat_in_measure
-        e.duration_beats = duration_beats
+        event.measure = measure
+        event.beat = beat_in_measure
+        event.duration_beats = duration_beats
 
 
-def _duration_beats_to_quarter_length(duration_beats: float) -> float:
-    """
-    Convert beats to music21 quarterLength.
-    Under 4/4 we treat 1 beat = 1 quarter note.
-    """
-    return float(duration_beats)
-
-
-def quantize_and_render(events: List[NoteEvent], analysis_data: AnalysisData) -> str:
-    """
-    Stage D: Quantize NoteEvent list and render to a MusicXML string.
-
-    This is the function that transcription.py imports:
-        from pipeline.stage_d import quantize_and_render
-    """
-    # --- 1. Get tempo & time signature from meta (with safe fallbacks) ---
-    meta = getattr(analysis_data, "meta", None)
-    tempo_bpm = 120.0
-    time_sig = "4/4"
-
-    if meta is not None:
-        tempo_bpm = getattr(meta, "tempo_bpm", tempo_bpm) or tempo_bpm
-        time_sig = getattr(meta, "time_signature", time_sig) or time_sig
-
-    # --- 2. Quantize events in-place ---
-    _quantize_notes_to_beats(events, tempo_bpm=tempo_bpm, time_signature=time_sig)
-
-    # --- 3. Build a music21 Score/Part ---
-
-    s = stream.Score()
-    s.insert(0, m21meta.Metadata())
-    s.metadata.title = "Transcription"
-    s.metadata.composer = "Music-Note-Creator"
+def _build_score(events: List[NoteEvent], tempo_bpm: float, time_signature: str, detected_key: str | None) -> stream.Score:
+    score = stream.Score()
+    score.insert(0, m21meta.Metadata())
+    score.metadata.title = "Analyzed Audio"
+    score.metadata.composer = "Music-Note-Creator"
 
     part = stream.Part()
     part.id = "P1"
+    part.append(tempo.MetronomeMark(number=tempo_bpm))
+    part.append(meter.TimeSignature(time_signature))
 
-    # Time signature & tempo
-    ts_num, ts_den = time_sig.split("/")
-    part.append(m21tempo.MetronomeMark(number=tempo_bpm))
-    part.append(meter.TimeSignature(f"{ts_num}/{ts_den}"))
-
-    # Optional key signature if meta contains it
-    detected_key = getattr(meta, "detected_key", None) if meta is not None else None
     if detected_key:
         part.append(m21key.Key(detected_key))
 
-    # Insert notes in (measure, beat, start_sec) order
-    def _sort_key(e: NoteEvent):
-        return (
-            getattr(e, "measure", 0) or 0,
-            getattr(e, "beat", 0.0) or 0.0,
-            getattr(e, "start_sec", 0.0) or 0.0,
-        )
+    for event in sorted(events, key=lambda e: e.start_sec):
+        n = m21note.Note(event.midi_note)
+        ql = float(event.duration_beats or 0.25)
+        n.quarterLength = max(ql, 0.25)
+        offset = float((event.measure - 1) * _parse_time_signature(time_signature) + ((event.beat or 1.0) - 1.0))
+        part.insert(offset, n)
 
-    for e in sorted(events, key=_sort_key):
-        n = m21note.Note(e.midi_note)
-        ql = _duration_beats_to_quarter_length(getattr(e, "duration_beats", 1.0) or 1.0)
-        n.quarterLength = max(ql, 0.25)  # never shorter than a 16th
-        part.append(n)
+    part.makeMeasures(inPlace=True)
+    score.insert(0, part)
+    return score
 
-    s.insert(0, part)
 
-    # --- 4. Vexflow layout info for frontend (optional but used elsewhere) ---
-    measures = []
-    for m in part.getElementsByClass("Measure"):
-        measures.append(
-            {
-                "number": int(m.number),
-                "width": 0,  # frontend decides actual width
-            }
-        )
+def quantize_and_render(events: List[NoteEvent], analysis_data: AnalysisData) -> str:
+    """Quantize NoteEvents and render them to a MusicXML string."""
 
-    # Attach layout to analysis_data if it expects it
-    try:
-        analysis_data.vexflow_layout = VexflowLayout(measures=measures)
-    except Exception:
-        # If AnalysisData doesn't match, just skip layout
-        pass
+    meta = analysis_data.meta
+    tempo_bpm = meta.tempo_bpm or 120.0
+    time_signature = meta.time_signature or "4/4"
 
-    # --- 5. Export to MusicXML string using GeneralObjectExporter ---
+    _quantize_events(events, tempo_bpm=tempo_bpm, time_signature=time_signature)
+    analysis_data.events = events
+
+    score = _build_score(events, tempo_bpm=tempo_bpm, time_signature=time_signature, detected_key=meta.detected_key)
+
+    measures = [{"number": int(m.number)} for m in score.parts[0].getElementsByClass("Measure")]
+    analysis_data.vexflow_layout = VexflowLayout(measures=measures)
+
     exporter = GeneralObjectExporter()
-    xml_obj = exporter.parse(s)
-
+    xml_obj = exporter.parse(score)
     if isinstance(xml_obj, (bytes, bytearray)):
-        musicxml_str = xml_obj.decode("utf-8")
-    else:
-        musicxml_str = str(xml_obj)
-
-    return musicxml_str
+        return xml_obj.decode("utf-8")
+    return str(xml_obj)
