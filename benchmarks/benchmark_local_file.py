@@ -282,6 +282,16 @@ def run_suite(
 
 
 def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -> None:
+    def _prf_from_counts(matched: int, missed: int, extra: int) -> tuple[float, float, float]:
+        precision_den = matched + extra
+        recall_den = matched + missed
+
+        precision = matched / precision_den if precision_den else 0.0
+        recall = matched / recall_den if recall_den else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+
+        return precision * 100, recall * 100, f1 * 100
+
     header = [
         "# Benchmark accuracy snapshot",
         "",
@@ -292,6 +302,7 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
     ]
 
     rows = []
+    threshold_pct = float(suite_summary.get("threshold", 0.0)) * 100
     for case in suite_summary.get("cases", []):
         pitch_pct = float(case["pitch_accuracy"]) * 100
         rhythm_pct = float(case["rhythm_accuracy"]) * 100
@@ -299,6 +310,9 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
         pitch_extra = case.get("pitch_extra", 0)
         rhythm_missed = case.get("rhythm_missed", 0)
         rhythm_extra = case.get("rhythm_extra", 0)
+
+        pitch_prf = _prf_from_counts(case.get("pitch_matched", 0), pitch_missed, pitch_extra)
+        rhythm_prf = _prf_from_counts(case.get("rhythm_matched", 0), rhythm_missed, rhythm_extra)
 
         pitch_samples = []
         if case.get("pitch_missed_onsets_sample"):
@@ -329,13 +343,33 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
         if rhythm_samples:
             samples_note.append("Rhythm " + "; ".join(rhythm_samples))
 
+        pitch_delta = pitch_pct - threshold_pct
+        rhythm_delta = rhythm_pct - threshold_pct
+
+        risk_flags = []
+        if pitch_pct < threshold_pct:
+            risk_flags.append("⚠️ pitch below threshold")
+        if rhythm_pct < threshold_pct:
+            risk_flags.append("⚠️ rhythm below threshold")
+
+        source_tag = (
+            case.get("recording_source")
+            or case.get("audio_source")
+            or case.get("source")
+            or "unspecified source"
+        )
+
         notes = " ".join(
             [
                 f"{case['predicted_notes']} predicted vs {case['reference_notes']} reference notes.",
                 pitch_note + ".",
+                f"Pitch Δ {pitch_delta:+.1f}pp vs {threshold_pct:.0f}%.",
                 rhythm_note + ".",
+                f"Rhythm Δ {rhythm_delta:+.1f}pp vs {threshold_pct:.0f}%.",
                 " ".join(samples_note),
                 f"Files: `{Path(case['predicted_musicxml']).name}` / `{Path(case['predicted_midi']).name}`.",
+                f"Source: {source_tag}.",
+                " ".join(risk_flags),
             ]
         ).strip()
         rows.append(
