@@ -21,6 +21,8 @@ export interface NoteEvent {
   pitch_label?: string; // e.g. "C4", "F#5"
   startBeat?: number;
   durationBeats?: number;
+  measure?: number;
+  beat?: number;
   staff?: 'treble' | 'bass';
   voice?: number; // 1 or 2
   fingering?: number | null;
@@ -42,6 +44,25 @@ export interface ChordEvent {
   root: string;
   quality: string;
   text: string;
+  beat?: number;
+  measure?: number;
+  startBeat?: number;
+}
+
+export interface TranscriptionMeta {
+  tempo_bpm: number;
+  time_signature: string;
+  tempo_override?: number | null;
+  beat_times_override?: number[] | null;
+}
+
+export interface AnalysisDataLite {
+  meta: TranscriptionMeta;
+  events: NoteEvent[];
+  chords: ChordEvent[];
+  notes?: NoteEvent[];
+  timeline?: any[];
+  vexflow_layout?: any;
 }
 
 export interface SlurValidationStats {

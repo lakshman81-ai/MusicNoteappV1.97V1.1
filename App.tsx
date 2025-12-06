@@ -232,7 +232,7 @@ const App: React.FC = () => {
         // 2. Transcribe
         const result = await TranscriptionService.transcribeAudio(file);
         setMusicXML(result.xml);
-        setTranscribedNotes(result.notes);
+        setTranscribedNotes(result.quantizedNotes || result.notes);
         setDetectedChords(result.chords);
 
         showToast("Transcription Complete", "success");
