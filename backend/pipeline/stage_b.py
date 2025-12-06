@@ -1,84 +1,78 @@
 from __future__ import annotations
 
 from typing import List, Tuple
+import importlib
+import os
+import tempfile
+from pathlib import Path
+import warnings
 
-import numpy as np
 import librosa
-import scipy.signal  # reserved for future use
+import numpy as np
 
-from .models import (
-    MetaData,
-    FramePitch,
-    NoteEvent,
-    ChordEvent,
-    AlternativePitch,
-)
-
-BASIC_PITCH_AVAILABLE = False  # explicitly disabled
-
-try:
-    import crepe
-
-    CREPE_AVAILABLE = True
-except ImportError:
-    CREPE_AVAILABLE = False
+from .models import MetaData, FramePitch, NoteEvent, ChordEvent
 
 
-# --------- PITCH BACKENDS --------- #
+def _crepe_available() -> bool:
+    return importlib.util.find_spec("crepe") is not None
 
 
-def _pitch_via_pyin(
+def _pitch_with_pyin(
     y: np.ndarray,
     sr: int,
     hop_length: int,
     fmin: float,
     fmax: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Pitch tracking using librosa.pyin (monophonic F0).
-    """
-    f0, voiced_flag, voiced_probs = librosa.pyin(
-        y,
-        fmin=fmin,
-        fmax=fmax,
-        sr=sr,
-        frame_length=2048,
-        hop_length=hop_length,
-    )
+    cache_dir = Path(tempfile.gettempdir()) / "numba_cache"
+    cache_dir.mkdir(exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(cache_dir))
+
+    try:
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            y,
+            fmin=fmin,
+            fmax=fmax,
+            sr=sr,
+            frame_length=2048,
+            hop_length=hop_length,
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        warnings.warn(f"librosa.pyin failed ({exc}); falling back to yin", RuntimeWarning)
+        f0 = librosa.yin(
+            y,
+            fmin=fmin,
+            fmax=fmax,
+            sr=sr,
+            frame_length=2048,
+            hop_length=hop_length,
+        )
+        voiced_flag = ~np.isnan(f0)
+        voiced_probs = np.where(voiced_flag, 0.5, 0.0)
+
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
     return times, f0, voiced_flag, voiced_probs
 
 
-def _pitch_via_crepe(
+def _pitch_with_crepe(
     y: np.ndarray,
     sr: int,
     hop_length: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    CREPE backend for F0. If installed, it usually performs better on piano.
-    """
+    crepe = importlib.import_module("crepe")
     step_size_ms = hop_length * 1000.0 / sr
-
-    # CREPE expects 16kHz
     if sr != 16000:
-        y_16k = librosa.resample(y, orig_sr=sr, target_sr=16000)
-        sr_crepe = 16000
+        y_resampled = librosa.resample(y, orig_sr=sr, target_sr=16000)
+        sr_used = 16000
     else:
-        y_16k = y
-        sr_crepe = sr
+        y_resampled = y
+        sr_used = sr
 
     time, frequency, confidence, _ = crepe.predict(
-        y_16k, sr_crepe, step_size=step_size_ms, viterbi=True
+        y_resampled, sr_used, step_size=step_size_ms, viterbi=True
     )
-
-    f0 = frequency.astype(float)
     voiced_flag = confidence > 0.3
-    voiced_probs = confidence.astype(float)
-    times = time.astype(float)
-    return times, f0, voiced_flag, voiced_probs
-
-
-# --------- TIMELINE BUILDING --------- #
+    return time.astype(float), frequency.astype(float), voiced_flag, confidence.astype(float)
 
 
 def _build_timeline(
@@ -87,104 +81,119 @@ def _build_timeline(
     voiced_flag: np.ndarray,
     voiced_probs: np.ndarray,
 ) -> List[FramePitch]:
-    from math import isnan
-
     timeline: List[FramePitch] = []
-    for t, hz, vflag, vprob in zip(times, f0, voiced_flag, voiced_probs):
-        if (not vflag) or hz is None or isnan(hz):
+    for t, hz, is_voiced, conf in zip(times, f0, voiced_flag, voiced_probs):
+        if hz is None or np.isnan(hz):
             timeline.append(
                 FramePitch(
                     time=float(t),
                     pitch_hz=0.0,
                     midi=None,
-                    confidence=float(vprob),
+                    confidence=float(conf) if np.isfinite(conf) else 0.0,
                 )
             )
-        else:
-            midi = int(round(librosa.hz_to_midi(hz)))
-            timeline.append(
-                FramePitch(
-                    time=float(t),
-                    pitch_hz=float(hz),
-                    midi=midi,
-                    confidence=float(vprob),
-                )
+            continue
+        midi = int(round(librosa.hz_to_midi(float(hz))))
+        timeline.append(
+            FramePitch(
+                time=float(t),
+                pitch_hz=float(hz),
+                midi=midi,
+                confidence=float(conf) if np.isfinite(conf) else 0.0,
             )
+        )
     return timeline
 
 
-# --------- SEGMENTATION (ONSET-DRIVEN) --------- #
-
-
-def _segment_notes_from_timeline_onsets(
+def _segment_notes_from_timeline(
     timeline: List[FramePitch],
-    onset_times: np.ndarray,
-    total_duration: float,
-    min_duration: float = 0.05,
+    frame_duration: float,
+    min_duration: float = 0.04,
+    pitch_jump: float = 0.6,
 ) -> List[NoteEvent]:
-    """
-    Segment notes using onset times as primary boundaries.
-
-    For each onset interval [t_k, t_{k+1}) we take the median MIDI pitch
-    from the timeline within that window.
-    """
     notes: List[NoteEvent] = []
     if not timeline:
         return notes
 
-    times = np.array([f.time for f in timeline], dtype=float)
-    midi_arr = np.array(
-        [f.midi if f.midi is not None and f.midi > 0 else np.nan for f in timeline],
-        dtype=float,
-    )
+    start_time: float | None = None
+    midi_values: List[int] = []
+    conf_values: List[float] = []
+    last_time: float | None = None
 
-    # Build boundaries: onset_0, onset_1, ..., final_time
-    if onset_times.size == 0:
-        # Fallback: treat entire clip as one region
-        onset_times = np.array([0.0], dtype=float)
-
-    boundaries = list(onset_times)
-    if not boundaries or boundaries[0] > 0.01:
-        boundaries.insert(0, 0.0)
-    if total_duration > boundaries[-1] + 0.01:
-        boundaries.append(total_duration)
-
-    boundaries = np.array(boundaries, dtype=float)
-
-    for i in range(len(boundaries) - 1):
-        start_t = float(boundaries[i])
-        end_t = float(boundaries[i + 1])
-        dur = end_t - start_t
-        if dur < min_duration:
+    for frame in timeline:
+        if frame.midi is None:
+            if start_time is not None and last_time is not None:
+                end_time = frame.time
+                duration = end_time - start_time
+                if duration >= min_duration and midi_values:
+                    midi_note = int(round(float(np.median(midi_values))))
+                    pitch_hz = float(librosa.midi_to_hz(midi_note))
+                    confidence = float(np.mean(conf_values)) if conf_values else 0.0
+                    notes.append(
+                        NoteEvent(
+                            start_sec=start_time,
+                            end_sec=end_time,
+                            midi_note=midi_note,
+                            pitch_hz=pitch_hz,
+                            confidence=confidence,
+                        )
+                    )
+                start_time = None
+                midi_values = []
+                conf_values = []
+            last_time = frame.time
             continue
 
-        # Frames in this interval
-        mask = (times >= start_t) & (times < end_t)
-        if not np.any(mask):
+        if start_time is None:
+            start_time = frame.time
+            midi_values = [frame.midi]
+            conf_values = [frame.confidence]
+            last_time = frame.time
             continue
 
-        seg = midi_arr[mask]
-        if np.all(np.isnan(seg)):
-            continue
+        current_median = float(np.median(midi_values))
+        if abs(frame.midi - current_median) > pitch_jump:
+            end_time = frame.time
+            duration = end_time - start_time
+            if duration >= min_duration and midi_values:
+                midi_note = int(round(current_median))
+                pitch_hz = float(librosa.midi_to_hz(midi_note))
+                confidence = float(np.mean(conf_values)) if conf_values else 0.0
+                notes.append(
+                    NoteEvent(
+                        start_sec=start_time,
+                        end_sec=end_time,
+                        midi_note=midi_note,
+                        pitch_hz=pitch_hz,
+                        confidence=confidence,
+                    )
+                )
+            start_time = frame.time
+            midi_values = [frame.midi]
+            conf_values = [frame.confidence]
+        else:
+            midi_values.append(frame.midi)
+            conf_values.append(frame.confidence)
+        last_time = frame.time
 
-        midi_median = float(np.nanmedian(seg))
-        midi_int = int(round(midi_median))
-        hz = float(librosa.midi_to_hz(midi_int))
-
-        notes.append(
-            NoteEvent(
-                start_sec=start_t,
-                end_sec=end_t,
-                midi_note=midi_int,
-                pitch_hz=hz,
-                confidence=1.0,
+    if start_time is not None:
+        end_time = (last_time or start_time) + frame_duration
+        duration = end_time - start_time
+        if duration >= min_duration and midi_values:
+            midi_note = int(round(float(np.median(midi_values))))
+            pitch_hz = float(librosa.midi_to_hz(midi_note))
+            confidence = float(np.mean(conf_values)) if conf_values else 0.0
+            notes.append(
+                NoteEvent(
+                    start_sec=start_time,
+                    end_sec=end_time,
+                    midi_note=midi_note,
+                    pitch_hz=pitch_hz,
+                    confidence=confidence,
+                )
             )
-        )
 
     return notes
-
-
-# --------- MAIN STAGE B ENTRYPOINT --------- #
 
 
 def extract_features(
@@ -194,51 +203,35 @@ def extract_features(
     use_crepe: bool = False,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
     """
-    Stage B: Feature Extraction
-
-    1. Pitch tracking (CREPE if available, else pyin)
-    2. Build frame-wise pitch timeline
-    3. Onset-based segmentation into notes
-    4. Placeholder chord list
+    Stage B: pitch tracking and simple note segmentation.
     """
-    hop_length = getattr(meta, "hop_length", 512) or 512
 
-    # Pitch range: piano-ish, but slightly generous
-    fmin = librosa.note_to_hz("A1")  # 55 Hz
-    fmax = librosa.note_to_hz("C7")  # 2093 Hz
+    hop_length = meta.hop_length or 256
+    # Constrain the search space to a practical vocal/instrument range to
+    # improve stability on simple melodies and avoid octave-jump artifacts.
+    fmin = librosa.note_to_hz("C2")
+    fmax = librosa.note_to_hz("C6")
 
-    # Decide backend
-    if use_crepe and CREPE_AVAILABLE:
-        times, f0, voiced_flag, voiced_probs = _pitch_via_crepe(y, sr, hop_length)
-    elif CREPE_AVAILABLE:
-        # If CREPE is installed, prefer it
-        times, f0, voiced_flag, voiced_probs = _pitch_via_crepe(y, sr, hop_length)
+    if use_crepe and _crepe_available():
+        times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(y, sr, hop_length)
+    elif _crepe_available():
+        times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(y, sr, hop_length)
     else:
-        times, f0, voiced_flag, voiced_probs = _pitch_via_pyin(
-            y, sr, hop_length, fmin=fmin, fmax=fmax
-        )
+        times, f0, voiced_flag, voiced_probs = _pitch_with_pyin(y, sr, hop_length, fmin=fmin, fmax=fmax)
 
-    # 1–2: timeline
     timeline = _build_timeline(times, f0, voiced_flag, voiced_probs)
 
-    # 3: onset detection on the waveform
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
-    onset_frames = librosa.onset.onset_detect(
-        onset_envelope=onset_env,
-        sr=sr,
-        hop_length=hop_length,
-        backtrack=True,
-        units="frames",
-    )
-    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+    if len(timeline) >= 2:
+        frame_duration = float(timeline[1].time - timeline[0].time)
+    else:
+        frame_duration = float(hop_length / sr)
 
-    total_duration = float(len(y) / sr)
-
-    notes = _segment_notes_from_timeline_onsets(
-        timeline, onset_times, total_duration, min_duration=0.05
+    notes = _segment_notes_from_timeline(
+        timeline,
+        frame_duration=frame_duration,
+        min_duration=0.04,
+        pitch_jump=0.6,
     )
 
-    # Placeholder chords (front-end can run its own chord estimation)
     chords: List[ChordEvent] = []
-
     return timeline, notes, chords

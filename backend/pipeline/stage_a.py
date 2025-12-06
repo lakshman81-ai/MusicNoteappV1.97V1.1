@@ -2,84 +2,96 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Tuple
-import math
 
-import numpy as np
 import librosa
-from scipy import signal as sps
+import numpy as np
+import pyloudnorm as pyln
+import soundfile as sf
 
 from .models import MetaData
 
-# Internal target sample rate
-TARGET_SR = 22050
+
+DEFAULT_TARGET_SR = 22050
+DEFAULT_HOP_LENGTH = 128
+TARGET_LUFS = -20.0
 
 
-def _resample_to_target(y: np.ndarray, sr: int, target_sr: int) -> tuple[np.ndarray, int]:
-    """
-    Resample using scipy.signal.resample_poly to avoid the resampy dependency.
-    """
+def _load_audio(audio_path: str) -> Tuple[np.ndarray, int]:
+    """Load audio from disk preserving the native sample rate."""
+
+    path_str = str(audio_path)
+    try:
+        data, sr = sf.read(path_str, always_2d=False)
+    except Exception:
+        data, sr = librosa.load(path_str, sr=None, mono=False)
+    y = np.asarray(data, dtype=np.float32)
+    return y, int(sr)
+
+
+def _to_mono(y: np.ndarray) -> np.ndarray:
+    """Downmix stereo to mono by averaging channels."""
+
+    if y.ndim == 1:
+        return y.astype(np.float32)
+    return np.mean(y, axis=1, dtype=np.float32)
+
+
+def _resample(y: np.ndarray, sr: int, target_sr: int) -> Tuple[np.ndarray, int]:
+    """Resample waveform to the target sample rate."""
+
     if sr == target_sr:
-        return y, sr
-
-    g = math.gcd(int(sr), int(target_sr))
-    up = target_sr // g
-    down = sr // g
-    y_resampled = sps.resample_poly(y, up, down)
+        return y.astype(np.float32), sr
+    y_resampled = librosa.resample(y.astype(np.float32), orig_sr=sr, target_sr=target_sr)
     return y_resampled.astype(np.float32), target_sr
 
 
+def _normalize_loudness(y: np.ndarray, sr: int) -> Tuple[np.ndarray, float | None]:
+    """Normalize loudness to approximately TARGET_LUFS with a peak fallback."""
+
+    try:
+        meter = pyln.Meter(sr)
+        loudness = meter.integrated_loudness(y)
+        y_norm = pyln.normalize.loudness(y, loudness, TARGET_LUFS)
+        return y_norm.astype(np.float32), float(loudness)
+    except Exception:
+        peak = float(np.max(np.abs(y)))
+        if peak > 0:
+            return (y / peak).astype(np.float32), None
+        return y.astype(np.float32), None
+
+
 def load_and_preprocess(
-    audio_path: str | Path,
-    stereo_mode: str | None = None,
-    start_offset: float = 0.0,
-    **kwargs,
+    audio_path: str,
+    target_sr: int = DEFAULT_TARGET_SR,
 ) -> Tuple[np.ndarray, int, MetaData]:
     """
-    Stage A: Load audio, convert to mono, normalize, resample, and create MetaData.
+    Stage A: load audio, convert to mono, resample, normalize, and emit metadata.
 
-    Args (for backward compatibility):
-        stereo_mode: ignored; we always convert to mono.
-        start_offset: seconds to skip at the start of the file.
-        **kwargs: ignored safely.
-
-    Returns:
-        y    : mono waveform (float32)
-        sr   : sample rate (int)
-        meta : MetaData instance populated with basic info
+    Returns a tuple of (waveform, sample_rate, MetaData).
     """
-    audio_path = str(audio_path)
 
-    # 1. Load raw audio at native sample rate, mono
-    y, sr = librosa.load(audio_path, sr=None, mono=True, offset=float(start_offset))
+    audio_path = str(Path(audio_path))
+    y, original_sr = _load_audio(audio_path)
 
     if y.size == 0:
-        raise ValueError("Empty audio file")
+        raise ValueError("Loaded audio is empty")
 
-    # 2. Normalize amplitude
-    max_val = float(np.max(np.abs(y)))
-    if max_val > 0:
-        y = y / max_val
+    y_mono = _to_mono(y)
+    y_resampled, sr_out = _resample(y_mono, original_sr, target_sr)
+    y_norm, loudness = _normalize_loudness(y_resampled, sr_out)
 
-    # 3. Resample to TARGET_SR
-    y, sr = _resample_to_target(y, sr, TARGET_SR)
+    duration_sec = float(len(y_norm) / sr_out)
 
-    # 4. Build MetaData with safe defaults
-    meta = MetaData()
+    meta = MetaData(
+        original_sr=original_sr,
+        target_sr=sr_out,
+        sample_rate=sr_out,
+        duration_sec=duration_sec,
+        hop_length=DEFAULT_HOP_LENGTH,
+        time_signature="4/4",
+        tempo_bpm=None,
+        detected_key=None,
+        lufs=loudness,
+    )
 
-    if hasattr(meta, "sample_rate"):
-        meta.sample_rate = sr
-
-    if hasattr(meta, "hop_length"):
-        # 512 at 22.05 kHz ≈ 23 ms
-        meta.hop_length = getattr(meta, "hop_length", 512) or 512
-
-    if hasattr(meta, "tempo_bpm"):
-        meta.tempo_bpm = getattr(meta, "tempo_bpm", 120.0) or 120.0
-
-    if hasattr(meta, "time_signature"):
-        meta.time_signature = getattr(meta, "time_signature", "4/4") or "4/4"
-
-    if hasattr(meta, "detected_key"):
-        meta.detected_key = getattr(meta, "detected_key", None)
-
-    return y.astype(np.float32), sr, meta
+    return y_norm.astype(np.float32), sr_out, meta
