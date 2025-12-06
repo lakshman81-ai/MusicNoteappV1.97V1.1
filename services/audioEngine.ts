@@ -3,6 +3,21 @@
 import { RhythmPattern } from '../components/constants';
 import { NoteEvent } from '../types';
 
+type FrameEstimate = {
+  time_sec: number;
+  midi: number | null;
+  confidence: number;
+  voiced: boolean;
+};
+
+type VoicingConfig = {
+  mode?: 'crepe' | 'pyin';
+  crepeConfidenceThreshold?: number;
+  pyinOnThreshold?: number;
+  pyinOffThreshold?: number;
+  medianWindow?: number;
+};
+
 // Krumhansl-Schmuckler Key-Finding Profiles
 const PROFILE_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
 const PROFILE_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
@@ -399,7 +414,12 @@ export class AudioEngine {
   /**
    * ADVANCED ANALYZER: Spectral Flux Onset + HPS Pitch Detection
    */
-  analyzeAudioSegment(audioBuffer: AudioBuffer, startTime: number, duration: number): NoteEvent[] {
+  analyzeAudioSegment(
+      audioBuffer: AudioBuffer,
+      startTime: number,
+      duration: number,
+      voicingConfig: VoicingConfig = {}
+  ): NoteEvent[] {
       const sampleRate = audioBuffer.sampleRate;
       const startSample = Math.floor(startTime * sampleRate);
       const endSample = Math.floor((startTime + duration) * sampleRate);
@@ -409,7 +429,7 @@ export class AudioEngine {
       const windowSize = 2048; // Good balance for Bass/Treble
       const hopSize = 512; // 75% Overlap
       
-      const frames: { time: number, frequency: number, confidence: number }[] = [];
+      const frames: FrameEstimate[] = [];
       
       const hanning = new Float32Array(windowSize);
       for(let i=0; i<windowSize; i++) hanning[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (windowSize - 1)));
@@ -419,24 +439,25 @@ export class AudioEngine {
           for(let j=0; j<windowSize; j++) chunk[j] = segmentData[i+j] * hanning[j];
           
           const result = this.harmonicPitchDetection(chunk, sampleRate);
-          
+
           let rms = 0;
           for(let s=0; s<windowSize; s++) rms += chunk[s] * chunk[s];
           rms = Math.sqrt(rms / windowSize);
 
-          if (rms > 0.01 && result.confidence > 0.4) {
-              frames.push({
-                  time: startTime + (i / sampleRate),
-                  frequency: result.frequency,
-                  confidence: result.confidence
-              });
-          } else {
-              frames.push({ time: startTime + (i / sampleRate), frequency: 0, confidence: 0 });
-          }
+          const hasEnergy = rms > 0.01 && result.confidence > 0.4;
+          const midi = result.frequency > 0 ? 69 + 12 * Math.log2(result.frequency / 440) : null;
+
+          frames.push({
+              time_sec: startTime + (i / sampleRate),
+              midi: hasEnergy ? midi : null,
+              confidence: hasEnergy ? result.confidence : 0,
+              voiced: false
+          });
       }
 
-      const detectedKey = this.detectKey(frames);
-      const smoothedFrames = this.smoothFrames(frames);
+      const framesWithVoicing = this.applyVoicing(frames, voicingConfig);
+      const detectedKey = this.detectKey(framesWithVoicing);
+      const smoothedFrames = this.smoothFrames(framesWithVoicing, voicingConfig);
       let notes = this.segmentNotes(smoothedFrames, hopSize / sampleRate);
       notes = this.harmonicQuantization(notes, detectedKey);
       notes = this.cleanupAndQuantize(notes);
@@ -551,14 +572,13 @@ export class AudioEngine {
       return merged;
   }
 
-  private detectKey(frames: any[]): { root: number, scale: 'major'|'minor', confidence: number } {
+  private detectKey(frames: FrameEstimate[]): { root: number, scale: 'major'|'minor', confidence: number } {
       const chroma = new Array(12).fill(0);
       let totalWeight = 0;
 
       frames.forEach(f => {
-          if (f.frequency > 0 && f.confidence > 0.3) {
-              const midi = 69 + 12 * Math.log2(f.frequency / 440);
-              const pitchClass = Math.round(midi) % 12;
+          if (f.voiced && f.midi !== null && f.confidence > 0.3) {
+              const pitchClass = Math.round(f.midi) % 12;
               chroma[pitchClass] += f.confidence;
               totalWeight += f.confidence;
           }
@@ -626,26 +646,67 @@ export class AudioEngine {
       });
   }
 
-  private smoothFrames(frames: any[]) {
-      const medianWindow = 7;
+  private clampMedianWindow(size: number | undefined) {
+      if (!size) return 13;
+      const clamped = Math.min(17, Math.max(11, size));
+      return clamped % 2 === 0 ? clamped - 1 : clamped;
+  }
+
+  private applyVoicing(frames: FrameEstimate[], voicing: VoicingConfig): FrameEstimate[] {
+      const mode = voicing.mode ?? 'crepe';
+      const crepeThreshold = voicing.crepeConfidenceThreshold ?? 0.3;
+      const pyinOn = voicing.pyinOnThreshold ?? 0.55;
+      const pyinOff = voicing.pyinOffThreshold ?? 0.35;
+
+      if (mode === 'pyin') {
+          let active = false;
+          return frames.map(frame => {
+              if (active) {
+                  if (frame.confidence <= pyinOff) active = false;
+              } else if (frame.confidence >= pyinOn) {
+                  active = true;
+              }
+
+              const voiced = active && frame.midi !== null;
+              return { ...frame, voiced, midi: voiced ? frame.midi : null };
+          });
+      }
+
+      return frames.map(frame => {
+          const voiced = frame.confidence >= crepeThreshold && frame.midi !== null;
+          return { ...frame, voiced, midi: voiced ? frame.midi : null };
+      });
+  }
+
+  private smoothFrames(frames: FrameEstimate[], voicing: VoicingConfig): FrameEstimate[] {
+      const windowSize = this.clampMedianWindow(voicing.medianWindow);
+      const halfWindow = Math.floor(windowSize / 2);
       const result = frames.map(f => ({ ...f }));
-      
+
       for (let i = 0; i < frames.length; i++) {
-          const start = Math.max(0, i - Math.floor(medianWindow / 2));
-          const end = Math.min(frames.length, i + Math.floor(medianWindow / 2) + 1);
-          const window = frames.slice(start, end).filter(f => f.frequency > 0).map(f => f.frequency);
-          
-          if (window.length > Math.floor(medianWindow / 2)) {
-              window.sort((a, b) => a - b);
-              result[i].frequency = window[Math.floor(window.length / 2)];
-          } else {
-              if (frames[i].frequency > 0 && window.length < 2) result[i].frequency = 0;
+          const start = Math.max(0, i - halfWindow);
+          const end = Math.min(frames.length, i + halfWindow + 1);
+          const windowMidis = frames
+              .slice(start, end)
+              .filter(f => f.voiced && f.midi !== null)
+              .map(f => f.midi as number);
+
+          if (windowMidis.length > halfWindow) {
+              windowMidis.sort((a, b) => a - b);
+              result[i].midi = windowMidis[Math.floor(windowMidis.length / 2)];
+              result[i].voiced = true;
+          } else if (!windowMidis.length) {
+              result[i].midi = null;
+              result[i].voiced = false;
+          } else if (frames[i].voiced && windowMidis.length < 2) {
+              result[i].midi = null;
+              result[i].voiced = false;
           }
       }
       return result;
   }
 
-  private segmentNotes(frames: any[], frameDuration: number): NoteEvent[] {
+  private segmentNotes(frames: FrameEstimate[], frameDuration: number): NoteEvent[] {
       const notes: NoteEvent[] = [];
       const pendingVoiced: { time: number, midi: number, confidence: number }[] = [];
       const stableFramesRequired = 3;
