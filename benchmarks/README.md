@@ -33,7 +33,13 @@ Add new scenarios by creating additional numbered folders that follow the same p
    ```bash
    python backend/benchmark_mock.py --iterations 5 --use-mock 0 --input benchmarks/01_scales/audio/c_major_scale_100bpm.wav
    ```
-4. Record timing, environment details, and qualitative notes in the scenario's `results.md` using the template below.
+4. To evaluate pitch and rhythm accuracy across all numbered scenarios at once, run:
+   ```bash
+   python benchmarks/benchmark_local_file.py --suite --use-crepe
+   ```
+   This saves per-clip JSON summaries under `benchmarks_results/`, updates `benchmarks/results_accuracy.md`, and exits with a
+   non-zero status if the average pitch or rhythm accuracy drops below 75%.
+5. Record timing, environment details, and qualitative notes in the scenario's `results.md` using the template below.
 
 ## Results template
 Copy this template into each scenario's `results.md` (already seeded in the starter files):
