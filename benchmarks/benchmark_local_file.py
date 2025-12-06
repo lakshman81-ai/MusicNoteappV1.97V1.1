@@ -19,6 +19,16 @@ NoteTuple = Tuple[int, float, float]  # (midi, onset_beats, duration_beats)
 
 
 @dataclass
+class MatchStats:
+    accuracy: float
+    matched: int
+    missed: int
+    extra: int
+    missed_onsets_sample: List[float]
+    extra_onsets_sample: List[float]
+
+
+@dataclass
 class BenchmarkCase:
     """Configuration for a single audio/reference pair."""
 
@@ -62,9 +72,22 @@ def match_accuracy(
     predicted: List[NoteTuple],
     tol_beats: float = 0.25,
     require_duration: bool = False,
-) -> MatchMetrics:
+    sample_limit: int = 5,
+) -> MatchStats:
+    if not reference:
+        extra_onsets = [p_onset for _, p_onset, _ in predicted][:sample_limit]
+        return MatchStats(
+            accuracy=0.0,
+            matched=0,
+            missed=0,
+            extra=len(predicted),
+            missed_onsets_sample=[],
+            extra_onsets_sample=extra_onsets,
+        )
+
     matched = 0
     used_pred: set[int] = set()
+    missed_onsets: List[float] = []
 
     for midi, onset, duration in reference:
         for idx, (p_midi, p_onset, p_duration) in enumerate(predicted):
@@ -79,20 +102,19 @@ def match_accuracy(
             matched += 1
             used_pred.add(idx)
             break
+        else:
+            if len(missed_onsets) < sample_limit:
+                missed_onsets.append(onset)
 
-    reference_total = len(reference)
-    predicted_total = len(predicted)
-    precision = matched / predicted_total if predicted_total else 0.0
-    recall = matched / reference_total if reference_total else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    extra_onsets = [p_onset for idx, (_, p_onset, _) in enumerate(predicted) if idx not in used_pred]
 
-    return MatchMetrics(
-        precision=precision,
-        recall=recall,
-        f1=f1,
+    return MatchStats(
+        accuracy=matched / len(reference),
         matched=matched,
-        reference_total=reference_total,
-        predicted_total=predicted_total,
+        missed=len(reference) - matched,
+        extra=len(extra_onsets),
+        missed_onsets_sample=missed_onsets,
+        extra_onsets_sample=extra_onsets[:sample_limit],
     )
 
 
@@ -145,14 +167,18 @@ def run_single_case(
         "reference": str(case.reference_path),
         "reference_notes": len(ref_notes),
         "predicted_notes": len(pred_notes),
-        "pitch_precision": pitch_stats.precision,
-        "pitch_recall": pitch_stats.recall,
-        "pitch_f1": pitch_stats.f1,
-        "rhythm_precision": rhythm_stats.precision,
-        "rhythm_recall": rhythm_stats.recall,
-        "rhythm_f1": rhythm_stats.f1,
-        "pitch_accuracy": pitch_stats.f1,
-        "rhythm_accuracy": rhythm_stats.f1,
+        "pitch_accuracy": pitch_stats.accuracy,
+        "pitch_matched": pitch_stats.matched,
+        "pitch_missed": pitch_stats.missed,
+        "pitch_extra": pitch_stats.extra,
+        "pitch_missed_onsets_sample": pitch_stats.missed_onsets_sample,
+        "pitch_extra_onsets_sample": pitch_stats.extra_onsets_sample,
+        "rhythm_accuracy": rhythm_stats.accuracy,
+        "rhythm_matched": rhythm_stats.matched,
+        "rhythm_missed": rhythm_stats.missed,
+        "rhythm_extra": rhythm_stats.extra,
+        "rhythm_missed_onsets_sample": rhythm_stats.missed_onsets_sample,
+        "rhythm_extra_onsets_sample": rhythm_stats.extra_onsets_sample,
         "predicted_musicxml": str(pred_xml_path),
         "predicted_midi": str(pred_mid_path),
     }
@@ -164,12 +190,14 @@ def run_single_case(
     print(f"Reference notes: {len(ref_notes)}")
     print(f"Predicted notes: {len(pred_notes)}")
     print(
-        "Pitch precision/recall/F1: "
-        f"{pitch_stats.precision * 100:.1f}% / {pitch_stats.recall * 100:.1f}% / {pitch_stats.f1 * 100:.1f}%"
+        "Pitch accuracy:  "
+        f"{pitch_stats.accuracy * 100:.1f}% | matched {pitch_stats.matched}, "
+        f"missed {pitch_stats.missed}, extra {pitch_stats.extra}"
     )
     print(
-        "Rhythm precision/recall/F1: "
-        f"{rhythm_stats.precision * 100:.1f}% / {rhythm_stats.recall * 100:.1f}% / {rhythm_stats.f1 * 100:.1f}% (±0.25 beats)"
+        "Rhythm accuracy: "
+        f"{rhythm_stats.accuracy * 100:.1f}% (±0.25 beats) | "
+        f"matched {rhythm_stats.matched}, missed {rhythm_stats.missed}, extra {rhythm_stats.extra}"
     )
     print(f"Predicted MusicXML saved to: {pred_xml_path}")
     print(f"Predicted MIDI saved to: {pred_mid_path}")
@@ -265,20 +293,51 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
 
     rows = []
     for case in suite_summary.get("cases", []):
-        pitch_prf = (
-            float(case["pitch_precision"]) * 100,
-            float(case["pitch_recall"]) * 100,
-            float(case["pitch_f1"]) * 100,
-        )
-        rhythm_prf = (
-            float(case["rhythm_precision"]) * 100,
-            float(case["rhythm_recall"]) * 100,
-            float(case["rhythm_f1"]) * 100,
-        )
-        notes = (
-            f"{case['predicted_notes']} predicted vs {case['reference_notes']} reference notes. "
-            f"Files: `{Path(case['predicted_musicxml']).name}` / `{Path(case['predicted_midi']).name}`."
-        )
+        pitch_pct = float(case["pitch_accuracy"]) * 100
+        rhythm_pct = float(case["rhythm_accuracy"]) * 100
+        pitch_missed = case.get("pitch_missed", 0)
+        pitch_extra = case.get("pitch_extra", 0)
+        rhythm_missed = case.get("rhythm_missed", 0)
+        rhythm_extra = case.get("rhythm_extra", 0)
+
+        pitch_samples = []
+        if case.get("pitch_missed_onsets_sample"):
+            pitch_samples.append(
+                "missed onsets: " + ", ".join(f"{v:.2f}" for v in case["pitch_missed_onsets_sample"])
+            )
+        if case.get("pitch_extra_onsets_sample"):
+            pitch_samples.append(
+                "extra onsets: " + ", ".join(f"{v:.2f}" for v in case["pitch_extra_onsets_sample"])
+            )
+
+        rhythm_samples = []
+        if case.get("rhythm_missed_onsets_sample"):
+            rhythm_samples.append(
+                "missed onsets: " + ", ".join(f"{v:.2f}" for v in case["rhythm_missed_onsets_sample"])
+            )
+        if case.get("rhythm_extra_onsets_sample"):
+            rhythm_samples.append(
+                "extra onsets: " + ", ".join(f"{v:.2f}" for v in case["rhythm_extra_onsets_sample"])
+            )
+
+        pitch_note = f"Pitch matched {case.get('pitch_matched', 0)} (missed {pitch_missed}, extra {pitch_extra})"
+        rhythm_note = f"Rhythm matched {case.get('rhythm_matched', 0)} (missed {rhythm_missed}, extra {rhythm_extra})"
+
+        samples_note = []
+        if pitch_samples:
+            samples_note.append("Pitch " + "; ".join(pitch_samples))
+        if rhythm_samples:
+            samples_note.append("Rhythm " + "; ".join(rhythm_samples))
+
+        notes = " ".join(
+            [
+                f"{case['predicted_notes']} predicted vs {case['reference_notes']} reference notes.",
+                pitch_note + ".",
+                rhythm_note + ".",
+                " ".join(samples_note),
+                f"Files: `{Path(case['predicted_musicxml']).name}` / `{Path(case['predicted_midi']).name}`.",
+            ]
+        ).strip()
         rows.append(
             "| "
             + " | ".join(
