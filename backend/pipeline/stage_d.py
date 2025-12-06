@@ -75,13 +75,6 @@ def quantize_and_render(events: List[NoteEvent], analysis_data: AnalysisData) ->
     tempo_bpm = meta.tempo_bpm or 120.0
     time_signature = meta.time_signature or "4/4"
 
-    if events:
-        start_offset = min(event.start_sec for event in events)
-        if start_offset > 0:
-            for event in events:
-                event.start_sec = max(0.0, event.start_sec - start_offset)
-                event.end_sec = max(event.start_sec + 1e-4, event.end_sec - start_offset)
-
     _quantize_events(events, tempo_bpm=tempo_bpm, time_signature=time_signature)
     analysis_data.events = events
 

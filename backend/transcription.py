@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
+import io
 from typing import Any, Dict
 
 from music21 import converter, midi
@@ -17,19 +16,12 @@ def _musicxml_to_midi_bytes(musicxml: str) -> bytes:
     """Convert a MusicXML string to MIDI bytes using music21."""
 
     score = converter.parseData(musicxml)
-    with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-
-    try:
-        score.write("midi", fp=str(tmp_path))
-        midi_bytes = tmp_path.read_bytes()
-    finally:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    return midi_bytes
+    midi_file = midi.translate.streamToMidiFile(score)
+    buffer = io.BytesIO()
+    midi_file.open(buffer)
+    midi_file.write()
+    midi_file.close()
+    return buffer.getvalue()
 
 
 def transcribe_audio_pipeline(audio_path: str, use_crepe: bool = False) -> Dict[str, Any]:

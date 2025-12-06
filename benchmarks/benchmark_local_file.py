@@ -60,18 +60,13 @@ def main() -> None:
         description="Benchmark local audio transcription against a reference MusicXML file."
     )
     parser.add_argument("audio_path", type=Path, help="Path to audio file (wav/mp3/etc.)")
-    parser.add_argument(
-        "reference_path",
-        type=Path,
-        nargs="?",
-        help="Optional reference MusicXML/MIDI file for scoring",
-    )
+    parser.add_argument("reference_path", type=Path, help="Path to reference MusicXML file")
     parser.add_argument("--use-crepe", action="store_true", help="Use CREPE for pitch tracking if available")
     args = parser.parse_args()
 
     if not args.audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {args.audio_path}")
-    if args.reference_path and not args.reference_path.exists():
+    if not args.reference_path.exists():
         raise FileNotFoundError(f"Reference file not found: {args.reference_path}")
 
     print(f"🎧 Audio: {args.audio_path}")
@@ -91,22 +86,17 @@ def main() -> None:
     pred_xml_path.write_text(musicxml_text, encoding="utf-8")
     pred_mid_path.write_bytes(midi_bytes)
 
+    ref_notes = extract_notes(args.reference_path)
     pred_notes = extract_notes(pred_xml_path)
 
-    print("\n=== BENCHMARK RESULT ===")
-    print(f"Predicted notes: {len(pred_notes)}")
-    if args.reference_path:
-        ref_notes = extract_notes(args.reference_path)
-        pitch_acc = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=False)
-        rhythm_acc = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=True)
-        print(f"Reference notes: {len(ref_notes)}")
-        print(f"Pitch accuracy:  {pitch_acc * 100:.1f}%")
-        print(f"Rhythm accuracy: {rhythm_acc * 100:.1f}% (±0.25 beats)")
-    else:
-        print("Reference notes: (skipped)")
-        print("Pitch accuracy:  (skipped, no reference provided)")
-        print("Rhythm accuracy: (skipped, no reference provided)")
+    pitch_acc = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=False)
+    rhythm_acc = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=True)
 
+    print("\n=== BENCHMARK RESULT ===")
+    print(f"Reference notes: {len(ref_notes)}")
+    print(f"Predicted notes: {len(pred_notes)}")
+    print(f"Pitch accuracy:  {pitch_acc * 100:.1f}%")
+    print(f"Rhythm accuracy: {rhythm_acc * 100:.1f}% (±0.25 beats)")
     print(f"Predicted MusicXML saved to: {pred_xml_path}")
     print(f"Predicted MIDI saved to: {pred_mid_path}")
 

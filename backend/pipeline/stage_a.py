@@ -5,31 +5,6 @@ import tempfile
 from pathlib import Path
 from typing import Tuple
 
-NUMBA_CACHE = Path(tempfile.gettempdir()) / "numba_cache"
-os.environ["NUMBA_CACHE_DIR"] = str(NUMBA_CACHE)
-os.environ.setdefault("NUMBA_NUM_THREADS", "1")
-# Disable numba JIT to avoid long compilation stalls or platform-specific failures
-# when librosa imports its sequence utilities (used by pyin/viterbi).
-os.environ["NUMBA_DISABLE_JIT"] = "1"
-
-import numba  # noqa: E402
-
-numba.config.DISABLE_JIT = True
-numba.config.CACHE_DIR = str(NUMBA_CACHE)
-
-
-def _noop_decorator(*_args, **_kwargs):
-    def wrapper(func):
-        return func
-
-    return wrapper
-
-
-numba.guvectorize = _noop_decorator  # type: ignore[attr-defined]
-numba.vectorize = _noop_decorator  # type: ignore[attr-defined]
-numba.jit = _noop_decorator  # type: ignore[attr-defined]
-numba.njit = _noop_decorator  # type: ignore[attr-defined]
-
 import librosa
 import numpy as np
 import pyloudnorm as pyln
@@ -87,27 +62,6 @@ def _normalize_loudness(y: np.ndarray, sr: int) -> Tuple[np.ndarray, float | Non
         return y.astype(np.float32), None
 
 
-def _pre_emphasize(y: np.ndarray) -> np.ndarray:
-    """Lightweight high-pass emphasis to tame low-frequency rumble in mp3s."""
-
-    try:
-        return librosa.effects.preemphasis(y).astype(np.float32)
-    except Exception:
-        return y.astype(np.float32)
-
-
-def _estimate_tempo(y: np.ndarray, sr: int) -> float | None:
-    """Estimate a plausible tempo to improve quantization on varied material."""
-
-    try:
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr, trim=False, start_bpm=120.0)
-        if np.isfinite(tempo) and tempo > 0:
-            return float(tempo)
-    except Exception:
-        return None
-    return None
-
-
 def load_and_preprocess(
     audio_path: str,
     target_sr: int = DEFAULT_TARGET_SR,
@@ -129,7 +83,6 @@ def load_and_preprocess(
     y_norm, loudness = _normalize_loudness(y_resampled, sr_out)
 
     duration_sec = float(len(y_norm) / sr_out)
-    tempo_est = _estimate_tempo(y_norm, sr_out)
 
     meta = MetaData(
         original_sr=original_sr,
@@ -138,7 +91,7 @@ def load_and_preprocess(
         duration_sec=duration_sec,
         hop_length=DEFAULT_HOP_LENGTH,
         time_signature="4/4",
-        tempo_bpm=tempo_est,
+        tempo_bpm=None,
         detected_key=None,
         lufs=loudness,
     )
