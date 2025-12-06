@@ -33,6 +33,7 @@ class MetaData:
     time_signature: str = "4/4"
     tempo_bpm: Optional[float] = None
     detected_key: Optional[str] = None
+    preprocessed_audio: Optional[Any] = None
 
     # Legacy/auxiliary fields kept for compatibility
     tuning_offset: float = 0.0
@@ -117,7 +118,11 @@ class AnalysisData:
         """JSON-serializable representation for debugging / API."""
 
         return {
-            "meta": asdict(self.meta),
+            "meta": {
+                key: value
+                for key, value in asdict(self.meta).items()
+                if key != "preprocessed_audio"
+            },
             "timeline": [asdict(f) for f in self.timeline],
             "notes": [
                 {
