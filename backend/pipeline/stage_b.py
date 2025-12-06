@@ -36,6 +36,8 @@ def _pitch_with_crepe(
     y: np.ndarray,
     sr: int,
     hop_length: int,
+    fmin: float,
+    fmax: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     crepe = importlib.import_module("crepe")
     step_size_ms = hop_length * 1000.0 / sr
@@ -58,6 +60,9 @@ def _build_timeline(
     f0: np.ndarray,
     voiced_flag: np.ndarray,
     voiced_probs: np.ndarray,
+    rms: np.ndarray | None,
+    min_confidence: float,
+    rms_floor: float | None,
 ) -> List[FramePitch]:
     timeline: List[FramePitch] = []
     for t, hz, is_voiced, conf in zip(times, f0, voiced_flag, voiced_probs):
