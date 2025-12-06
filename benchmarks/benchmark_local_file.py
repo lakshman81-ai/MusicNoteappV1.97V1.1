@@ -348,6 +348,7 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
     ]
 
     rows = []
+    threshold = float(suite_summary.get("threshold", 0.75))
     for case in suite_summary.get("cases", []):
         pitch_missed = case.get("pitch_missed", 0)
         pitch_extra = case.get("pitch_extra", 0)
