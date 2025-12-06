@@ -32,6 +32,8 @@ def transcribe_audio_pipeline(
     use_crepe: bool = False,
     tempo_override: float | None = None,
     beat_times_override: list[float] | None = None,
+    velocity_humanization: float | None = None,
+    velocity_seed: int | None = None,
 ) -> Dict[str, Any]:
     """
     High-level API for the transcription pipeline (Stages A→D).
@@ -45,7 +47,14 @@ def transcribe_audio_pipeline(
     meta.tempo_bpm = tempo_override or meta.tempo_bpm
     meta.beat_times_override = beat_times_override
 
-    timeline, notes, chords = extract_features(y, sr, meta, use_crepe=use_crepe)
+    timeline, notes, chords = extract_features(
+        y,
+        sr,
+        meta,
+        use_crepe=use_crepe,
+        velocity_humanization=velocity_humanization,
+        velocity_seed=velocity_seed,
+    )
 
     analysis_data = AnalysisData(meta=meta, timeline=timeline, events=notes, chords=chords)
     events_with_theory = apply_theory(notes, analysis_data)
@@ -72,6 +81,8 @@ def transcribe_audio(
     use_crepe: bool = False,
     tempo_override: float | None = None,
     beat_times_override: list[float] | None = None,
+    velocity_humanization: float | None = None,
+    velocity_seed: int | None = None,
 ) -> str:
     """Return only the MusicXML string for an audio file."""
 
@@ -80,5 +91,7 @@ def transcribe_audio(
         use_crepe=use_crepe,
         tempo_override=tempo_override,
         beat_times_override=beat_times_override,
+        velocity_humanization=velocity_humanization,
+        velocity_seed=velocity_seed,
     )
     return result["musicxml"]

@@ -288,6 +288,11 @@ def _segment_notes_from_timeline(
     rest_threshold: float = 0.08,
     median_window: int = 5,
     alt_pitch_frames: List[List[int]] | None = None,
+    rms: np.ndarray | None = None,
+    rms_floor: float | None = None,
+    velocity_range: tuple[int, int] = (20, 105),
+    velocity_humanization: float | None = None,
+    velocity_seed: int | None = None,
 ) -> List[NoteEvent]:
     """Segment notes using a voiced/unvoiced HMM with Viterbi decoding.
 
@@ -329,6 +334,13 @@ def _segment_notes_from_timeline(
 
     if np.all(~np.isfinite(smoothed_midi)):
         return []
+
+    vel_min, vel_max = velocity_range
+    humanize_amount = None
+    rng = None
+    if velocity_humanization is not None and velocity_humanization > 0:
+        humanize_amount = float(min(velocity_humanization, 5.0))
+        rng = np.random.default_rng(velocity_seed)
 
     observed_midis = smoothed_midi[np.isfinite(smoothed_midi)]
     midi_min = int(np.floor(np.min(observed_midis))) - 1
@@ -457,6 +469,7 @@ def _segment_notes_from_timeline(
 
     # Convert segments into notes while handling gap-aware merging.
     candidate_notes: List[NoteEvent] = []
+    rms_peak = float(np.max(rms)) if rms is not None and rms.size else None
     for state, start_idx, end_idx in segments:
         if state is None:
             continue
@@ -469,6 +482,15 @@ def _segment_notes_from_timeline(
         midi_value = int(round(float(np.nanmedian(midi_values))))
         pitch_hz = float(librosa.midi_to_hz(midi_value))
         confidence = float(np.mean(conf_obs[start_idx:end_idx]))
+        velocity = float((vel_min + vel_max) / 2.0)
+        if rms is not None and rms_peak is not None and rms_peak > 0:
+            note_rms = float(np.mean(rms[start_idx:end_idx]))
+            floor = rms_floor if rms_floor is not None else 0.0
+            norm = np.clip((note_rms - floor) / max(rms_peak - floor, 1e-6), 0.0, 1.0)
+            velocity = float(vel_min + norm * (vel_max - vel_min))
+        if humanize_amount is not None and rng is not None:
+            velocity += float(rng.uniform(-humanize_amount, humanize_amount))
+        velocity = float(np.clip(velocity, vel_min, vel_max))
         alternatives: List[AlternativePitch] = []
         if alt_pitch_frames is not None and alt_pitch_frames:
             window_alts = [p for frame in alt_pitch_frames[start_idx:end_idx] for p in frame if p != midi_value]
@@ -487,6 +509,7 @@ def _segment_notes_from_timeline(
                 midi_note=midi_value,
                 pitch_hz=pitch_hz,
                 confidence=confidence,
+                velocity=velocity,
                 alternatives=alternatives,
             )
         )
@@ -507,6 +530,7 @@ def _segment_notes_from_timeline(
                 midi_note=last.midi_note,
                 pitch_hz=float(librosa.midi_to_hz(last.midi_note)),
                 confidence=float((last.confidence + note.confidence) / 2.0),
+                velocity=float((last.velocity + note.velocity) / 2.0),
             )
         else:
             merged_notes.append(note)
@@ -519,6 +543,8 @@ def extract_features(
     sr: int,
     meta: MetaData,
     use_crepe: bool = False,
+    velocity_humanization: float | None = None,
+    velocity_seed: int | None = None,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
     """
     Stage B: pitch tracking and simple note segmentation.
@@ -546,6 +572,7 @@ def extract_features(
     )
     midi_smoothed = _smooth_midi_with_voicing(refined_f0, voiced_probs)
 
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop_length)[0]
     alt_pitch_frames = _estimate_polyphonic_peaks(
         y,
         sr,
@@ -555,15 +582,22 @@ def extract_features(
         target_frames=len(times),
     )
 
+    if rms.size < len(times):
+        pad_width = len(times) - rms.size
+        rms = np.pad(rms, (0, pad_width), mode="edge")
+    else:
+        rms = rms[: len(times)]
+    rms_floor = float(np.percentile(rms, 10)) if rms.size else None
+
     timeline = _build_timeline(
         times,
         refined_f0,
         voiced_mask,
         voiced_probs,
         midi_smoothed,
-        rms=None,
+        rms=rms,
         min_confidence=0.0,
-        rms_floor=None,
+        rms_floor=rms_floor,
     )
 
     if len(timeline) >= 2:
@@ -579,6 +613,10 @@ def extract_features(
         rest_threshold=0.08,
         median_window=5,
         alt_pitch_frames=alt_pitch_frames,
+        rms=rms,
+        rms_floor=rms_floor,
+        velocity_humanization=velocity_humanization,
+        velocity_seed=velocity_seed,
     )
 
     chords: List[ChordEvent] = []

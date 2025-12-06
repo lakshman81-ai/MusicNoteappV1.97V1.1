@@ -521,21 +521,25 @@ export class AudioEngine {
       };
   }
 
-  public cleanupAndQuantize(notes: NoteEvent[]): NoteEvent[] {
+  public cleanupAndQuantize(notes: NoteEvent[], tempoBpm: number = 120): NoteEvent[] {
       if (notes.length === 0) return [];
+
+      const secondsPerBeat = 60 / tempoBpm;
+      const gridSize = secondsPerBeat / 4; // 1/16 note resolution
+      const minDuration = gridSize; // At least one grid unit
+      const mergeGap = gridSize / 2; // 1/32 note gaps are merged
 
       let cleanNotes = notes.filter(n => n.duration > 0.08);
 
-      const GRID_SIZE = 0.125; 
       cleanNotes = cleanNotes.map(n => {
-          const snappedStart = Math.round(n.start_time / GRID_SIZE) * GRID_SIZE;
-          let snappedDuration = Math.round(n.duration / GRID_SIZE) * GRID_SIZE;
-          if (snappedDuration < GRID_SIZE) snappedDuration = GRID_SIZE;
-          
+          const snappedStart = Math.max(0, Math.round(n.start_time / gridSize) * gridSize);
+          const snappedEnd = Math.round((n.start_time + n.duration) / gridSize) * gridSize;
+          const adjustedEnd = Math.max(snappedEnd, snappedStart + minDuration);
+
           return {
               ...n,
               start_time: snappedStart,
-              duration: snappedDuration
+              duration: adjustedEnd - snappedStart
           };
       });
 
@@ -546,21 +550,21 @@ export class AudioEngine {
 
       for (const note of cleanNotes) {
           const pitchKey = Math.round(note.midi_pitch);
-          
+
           if (activeNotes.has(pitchKey)) {
               const prevIdx = activeNotes.get(pitchKey)!;
               const prev = merged[prevIdx];
-              
+
               const gap = note.start_time - (prev.start_time + prev.duration);
-              
-              if (gap < 0.15) {
+
+              if (gap < mergeGap) {
                   const newEnd = Math.max(prev.start_time + prev.duration, note.start_time + note.duration);
                   prev.duration = newEnd - prev.start_time;
                   prev.confidence = Math.max(prev.confidence, note.confidence);
-                  continue; 
+                  continue;
               }
           }
-          
+
           merged.push(note);
           activeNotes.set(pitchKey, merged.length - 1);
       }
@@ -704,51 +708,133 @@ export class AudioEngine {
 
   private segmentNotes(frames: FrameEstimate[], frameDuration: number): NoteEvent[] {
       const notes: NoteEvent[] = [];
-      let currentNote: any = null;
-      const minNoteDuration = 0.08;
+      const pendingVoiced: { time: number, midi: number, confidence: number }[] = [];
+      const stableFramesRequired = 3;
+      const hysteresisSemitone = 1;
+      const splitSemitone = 3;
+      const minNoteDuration = 0.04;
+      const gapMergeThreshold = 0.03;
+      const unvoicedTolerance = 2;
+      const confidenceThreshold = 0.3;
+
+      let currentNote: NoteEvent | null = null;
+      let unvoicedFrames = 0;
+
+      const startNoteFromPending = () => {
+          if (pendingVoiced.length < stableFramesRequired) return;
+          const pitchSpread = Math.max(...pendingVoiced.map(p => p.midi)) - Math.min(...pendingVoiced.map(p => p.midi));
+          if (pitchSpread > hysteresisSemitone) return;
+
+          const totalDuration = pendingVoiced.length * frameDuration;
+          const weightedPitch = pendingVoiced.reduce((acc, p) => acc + p.midi * frameDuration, 0) / totalDuration;
+          const maxConfidence = Math.max(...pendingVoiced.map(p => p.confidence));
+
+          currentNote = {
+              id: `gen_${Date.now()}_${notes.length}`,
+              start_time: pendingVoiced[0].time,
+              duration: totalDuration,
+              midi_pitch: weightedPitch,
+              velocity: Math.min(1, maxConfidence * 2),
+              confidence: maxConfidence
+          };
+          pendingVoiced.length = 0;
+      };
+
+      const finalizeCurrentNote = () => {
+          if (currentNote) notes.push(currentNote);
+          currentNote = null;
+      };
 
       for (const frame of frames) {
-          if (!frame.voiced || frame.midi === null) {
-              if (currentNote) {
-                  if (currentNote.duration >= minNoteDuration) notes.push(currentNote);
-                  currentNote = null;
+          const isVoiced = frame.frequency > 0 && frame.confidence > confidenceThreshold;
+
+          if (!isVoiced) {
+              unvoicedFrames += 1;
+              pendingVoiced.length = 0;
+
+              if (currentNote && unvoicedFrames >= unvoicedTolerance) {
+                  finalizeCurrentNote();
               }
               continue;
           }
 
-          const midiPitch = frame.midi;
+          unvoicedFrames = 0;
+          const midiPitch = 69 + 12 * Math.log2(frame.frequency / 440);
 
           if (currentNote) {
-              if (Math.abs(currentNote.midi_pitch - midiPitch) < 0.8) {
+              if (Math.abs(currentNote.midi_pitch - midiPitch) > splitSemitone) {
+                  finalizeCurrentNote();
+                  pendingVoiced.push({ time: frame.time, midi: midiPitch, confidence: frame.confidence });
+                  startNoteFromPending();
+              } else {
                   const totalDuration = currentNote.duration + frameDuration;
                   currentNote.midi_pitch = (currentNote.midi_pitch * currentNote.duration + midiPitch * frameDuration) / totalDuration;
                   currentNote.duration = totalDuration;
                   currentNote.confidence = Math.max(currentNote.confidence, frame.confidence);
-              } else {
-                  if (currentNote.duration >= minNoteDuration) notes.push(currentNote);
-                  currentNote = {
-                      id: `gen_${Date.now()}_${notes.length}`,
-                      start_time: frame.time_sec,
-                      duration: frameDuration,
-                      midi_pitch: midiPitch,
-                      velocity: Math.min(1, frame.confidence * 2),
-                      confidence: frame.confidence
-                  };
+                  currentNote.velocity = Math.max(currentNote.velocity, Math.min(1, frame.confidence * 2));
               }
           } else {
-              currentNote = {
-                  id: `gen_${Date.now()}_${notes.length}`,
-                  start_time: frame.time_sec,
-                  duration: frameDuration,
-                  midi_pitch: midiPitch,
-                  velocity: Math.min(1, frame.confidence * 2),
-                  confidence: frame.confidence
-              };
+              pendingVoiced.push({ time: frame.time, midi: midiPitch, confidence: frame.confidence });
+              if (pendingVoiced.length > stableFramesRequired) pendingVoiced.shift();
+              startNoteFromPending();
           }
       }
-      
-      if (currentNote && currentNote.duration >= minNoteDuration) notes.push(currentNote);
-      return notes;
+
+      if (currentNote) finalizeCurrentNote();
+
+      const mergedNotes: NoteEvent[] = [];
+      for (const note of notes) {
+          const last = mergedNotes[mergedNotes.length - 1];
+          if (last) {
+              const gap = note.start_time - (last.start_time + last.duration);
+              if (gap < gapMergeThreshold) {
+                  const combinedDuration = (note.start_time + note.duration) - last.start_time;
+                  const weightedPitch = (last.midi_pitch * last.duration + note.midi_pitch * note.duration) / (last.duration + note.duration);
+                  last.duration = combinedDuration;
+                  last.midi_pitch = weightedPitch;
+                  last.velocity = Math.max(last.velocity, note.velocity);
+                  last.confidence = Math.max(last.confidence, note.confidence);
+                  continue;
+              }
+          }
+          mergedNotes.push({ ...note });
+      }
+
+      const enforceMinDuration = (inputNotes: NoteEvent[]): NoteEvent[] => {
+          const output: NoteEvent[] = [];
+          for (let i = 0; i < inputNotes.length; i++) {
+              const note = { ...inputNotes[i] };
+              if (note.duration >= minNoteDuration) {
+                  output.push(note);
+                  continue;
+              }
+
+              const next = inputNotes[i + 1];
+              if (next) {
+                  const combinedDuration = (next.start_time + next.duration) - note.start_time;
+                  const weightedPitch = (note.midi_pitch * note.duration + next.midi_pitch * next.duration) / (note.duration + next.duration);
+                  inputNotes[i + 1] = {
+                      ...next,
+                      start_time: note.start_time,
+                      duration: combinedDuration,
+                      midi_pitch: weightedPitch,
+                      velocity: Math.max(note.velocity, next.velocity),
+                      confidence: Math.max(note.confidence, next.confidence)
+                  };
+              } else if (output.length) {
+                  const prev = output[output.length - 1];
+                  const combinedDuration = (note.start_time + note.duration) - prev.start_time;
+                  const weightedPitch = (prev.midi_pitch * prev.duration + note.midi_pitch * note.duration) / (prev.duration + note.duration);
+                  prev.duration = combinedDuration;
+                  prev.midi_pitch = weightedPitch;
+                  prev.velocity = Math.max(prev.velocity, note.velocity);
+                  prev.confidence = Math.max(prev.confidence, note.confidence);
+              }
+          }
+          return output;
+      };
+
+      return enforceMinDuration(mergedNotes);
   }
 }
 
