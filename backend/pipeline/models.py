@@ -32,6 +32,8 @@ class MetaData:
     hop_length: int = 256
     time_signature: str = "4/4"
     tempo_bpm: Optional[float] = None
+    tempo_override: Optional[float] = None
+    beat_times_override: Optional[list[float]] = None
     detected_key: Optional[str] = None
     preprocessed_audio: Optional[Any] = None
 

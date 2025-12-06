@@ -528,7 +528,7 @@ def extract_features(
     fmin = librosa.note_to_hz("A1")
     fmax = librosa.note_to_hz("C7")
 
-    if _crepe_available():
+    if use_crepe and _crepe_available():
         times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(y, sr, hop_length)
     else:
         try:
