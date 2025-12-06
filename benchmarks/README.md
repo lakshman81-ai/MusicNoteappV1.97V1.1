@@ -1,9 +1,8 @@
-# Benchmark Plan
+# Benchmark plan and refinement guide
 
-This directory holds reusable fixtures and notes for evaluating the transcription pipeline. Use the structure and checklists below to keep inputs, ground truths, and timing results consistent across scenarios.
+This directory holds fixtures and scripts for evaluating the transcription pipeline end-to-end. Use the steps below to run the suite, interpret the metrics, and tune the quantization/tempo logic when accuracy drifts.
 
 ## Directory layout
-
 ```
 benchmarks/
   01_scales/
@@ -15,31 +14,54 @@ benchmarks/
   03_melody_plus_chords/
   04_pop_loops/
 ```
+Add new scenarios by creating additional numbered folders that follow the same pattern (README + results.md + fixture subfolders). Keep corresponding reference files aligned by basename (e.g., `folk_tune_in_g.mid` and `folk_tune_in_g_reference.musicxml`).
 
-Add new scenarios by creating additional numbered folders that follow the same pattern (README + results.md + fixture subfolders).
-
-## Naming conventions
-- Use short, descriptive filenames such as `c_major_scale_100bpm.wav` or `folk_tune_in_g.mid`.
-- Keep corresponding reference files aligned by basename (e.g., `folk_tune_in_g.mid` and `folk_tune_in_g_reference.musicxml`).
-- Store mock-friendly XML/MIDI fixtures under `references/` so the mock pipeline can be exercised without audio dependencies.
+## Prerequisites
+- Python 3.10+ with `pip install -r backend/requirements.txt`.
+- `ffmpeg` installed if you plan to benchmark MP3 fixtures.
+- Audio/reference pairs placed under `benchmarks/audio/` and `benchmarks/reference/` (see defaults in `get_default_suite()` inside `benchmark_local_file.py`).
 
 ## Running benchmarks
-1. Populate the scenario folder with at least one audio fixture and, when possible, a reference file.
-2. Run the mock pipeline for quick smoke checks:
+1. **Quick smoke (mock pipeline):**
    ```bash
    python backend/benchmark_mock.py --iterations 5 --use-mock 1 --input benchmarks/01_scales/audio/c_major_scale_100bpm.wav
    ```
-3. Once audio dependencies are available, run the full pipeline for the same fixture:
+2. **Full pipeline for one clip:**
    ```bash
    python backend/benchmark_mock.py --iterations 5 --use-mock 0 --input benchmarks/01_scales/audio/c_major_scale_100bpm.wav
    ```
-4. To evaluate pitch and rhythm accuracy across all numbered scenarios at once, run:
+   Use this when you only want timing and MIDI/MusicXML exports without accuracy scoring.
+3. **Accuracy for a single audio/reference pair:**
    ```bash
-   python benchmarks/benchmark_local_file.py --suite --use-crepe
+   python benchmarks/benchmark_local_file.py benchmarks/audio/Simple\ Scale\ –\ C\ Major.mp3 benchmarks/reference/c_major_scale.musicxml --use-crepe
    ```
-   This saves per-clip JSON summaries under `benchmarks_results/`, updates `benchmarks/results_accuracy.md`, and exits with a
-   non-zero status if the average pitch or rhythm accuracy drops below 75%.
-5. Record timing, environment details, and qualitative notes in the scenario's `results.md` using the template below.
+   Outputs MusicXML/MIDI predictions plus a JSON summary (note counts, pitch/rhythm accuracy) in `benchmarks_results/`.
+4. **Full suite accuracy snapshot:**
+   ```bash
+   python benchmarks/benchmark_local_file.py --suite --use-crepe --threshold 0.75 \
+     --output-dir benchmarks_results \
+     --report benchmarks/results_accuracy.md
+   ```
+   - `--use-crepe` enables CREPE pitch tracking when installed.
+   - `--threshold` fails the command if average pitch or rhythm accuracy falls below the given fraction (default 0.75), which is useful for CI.
+   - `--output-dir` collects per-clip `*_pred.musicxml`, `*_pred.mid`, and `*_summary.json` artifacts.
+   - `--report` writes a Markdown rollup to `benchmarks/results_accuracy.md`.
+
+### Interpreting results
+- **Pitch accuracy:** percent of reference notes matched on MIDI pitch and onset within ±0.25 beat.
+- **Rhythm accuracy:** also requires duration match within ±0.25 beat.
+- **JSON summaries:** include the number of reference vs. predicted notes to quickly spot over/under-quantization.
+- **MusicXML/MIDI exports:** open these alongside the reference to listen for drift or missing notes; filenames mirror the audio slug (e.g., `simple_scale_–_c_major_pred.musicxml`).
+
+## Refining the transcription logic
+The suite exercises the full pipeline. If accuracy drops, adjust these hotspots before re-running the commands above:
+
+- **Tempo and beat tracking:** `_estimate_tempo_and_beats` in `backend/pipeline/stage_d.py` falls back to `meta.tempo_bpm` (default 120 BPM) when beat tracking fails. Tuning `hop_length` or providing better `meta` defaults can improve the beat grid.
+- **Subdivision density:** `_determine_subdivisions` chooses how many grid divisions per beat (2–8) based on tempo. Increase `TARGET_SUBDIVISION_SEC` or clamp `subdivisions` to change how finely notes snap to the grid.
+- **Minimum durations:** `_quantize_events` enforces a tiny positive duration when start/end quantize to the same slot. Adjust the guard or subdivision choice if you see clipped notes.
+- **Measure placement and rendering:** `_build_score` inserts tempo, time signature, and key (when detected) before writing MusicXML. If measures look misaligned, verify `analysis_data.meta.time_signature` and the order of `NoteEvent` onsets.
+
+After each change, rerun the single-clip command to inspect the exported MusicXML/MIDI, then rerun the suite to confirm pitch/rhythm accuracy improvements.
 
 ## Results template
 Copy this template into each scenario's `results.md` (already seeded in the starter files):
@@ -53,11 +75,9 @@ Copy this template into each scenario's `results.md` (already seeded in the star
 | 2025-02-15 | abc1234, Ubuntu, full pipeline | c_major_scale_100bpm.wav         | full  | 5          | 0.480   | 0.525   | 0.610   | Initial full run |
 ```
 
-Include extra context below the table when comparing different model versions, noise levels, or quantization settings.
-Recommended Benchmark Order (from easy → hard)
-Difficulty	File
-Very Easy	C Major Scale
-Easy	Twinkle Twinkle
-Medium	Ode to Joy
-Medium-Hard	Amazing Grace (flute, vibrato)
-Hard	Happy Birthday
+### Recommended benchmark order (easy → hard)
+- Very Easy: C Major Scale
+- Easy: Twinkle Twinkle
+- Medium: Ode to Joy
+- Medium-Hard: Amazing Grace (flute, vibrato)
+- Hard: Happy Birthday
