@@ -2,10 +2,6 @@ from __future__ import annotations
 
 from typing import List, Tuple
 import importlib
-import os
-import tempfile
-from pathlib import Path
-import warnings
 
 import librosa
 import numpy as np
@@ -24,32 +20,14 @@ def _pitch_with_pyin(
     fmin: float,
     fmax: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    cache_dir = Path(tempfile.gettempdir()) / "numba_cache"
-    cache_dir.mkdir(exist_ok=True)
-    os.environ.setdefault("NUMBA_CACHE_DIR", str(cache_dir))
-
-    try:
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            y,
-            fmin=fmin,
-            fmax=fmax,
-            sr=sr,
-            frame_length=2048,
-            hop_length=hop_length,
-        )
-    except Exception as exc:  # pragma: no cover - defensive fallback
-        warnings.warn(f"librosa.pyin failed ({exc}); falling back to yin", RuntimeWarning)
-        f0 = librosa.yin(
-            y,
-            fmin=fmin,
-            fmax=fmax,
-            sr=sr,
-            frame_length=2048,
-            hop_length=hop_length,
-        )
-        voiced_flag = ~np.isnan(f0)
-        voiced_probs = np.where(voiced_flag, 0.5, 0.0)
-
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y,
+        fmin=fmin,
+        fmax=fmax,
+        sr=sr,
+        frame_length=2048,
+        hop_length=hop_length,
+    )
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
     return times, f0, voiced_flag, voiced_probs
 
@@ -83,15 +61,8 @@ def _build_timeline(
 ) -> List[FramePitch]:
     timeline: List[FramePitch] = []
     for t, hz, is_voiced, conf in zip(times, f0, voiced_flag, voiced_probs):
-        if hz is None or np.isnan(hz):
-            timeline.append(
-                FramePitch(
-                    time=float(t),
-                    pitch_hz=0.0,
-                    midi=None,
-                    confidence=float(conf) if np.isfinite(conf) else 0.0,
-                )
-            )
+        if not is_voiced or hz is None or np.isnan(hz):
+            timeline.append(FramePitch(time=float(t), pitch_hz=0.0, midi=None, confidence=float(conf)))
             continue
         midi = int(round(librosa.hz_to_midi(float(hz))))
         timeline.append(
@@ -99,7 +70,7 @@ def _build_timeline(
                 time=float(t),
                 pitch_hz=float(hz),
                 midi=midi,
-                confidence=float(conf) if np.isfinite(conf) else 0.0,
+                confidence=float(conf),
             )
         )
     return timeline
@@ -108,7 +79,7 @@ def _build_timeline(
 def _segment_notes_from_timeline(
     timeline: List[FramePitch],
     frame_duration: float,
-    min_duration: float = 0.04,
+    min_duration: float = 0.06,
     pitch_jump: float = 0.6,
 ) -> List[NoteEvent]:
     notes: List[NoteEvent] = []
@@ -207,10 +178,8 @@ def extract_features(
     """
 
     hop_length = meta.hop_length or 256
-    # Constrain the search space to a practical vocal/instrument range to
-    # improve stability on simple melodies and avoid octave-jump artifacts.
-    fmin = librosa.note_to_hz("C2")
-    fmax = librosa.note_to_hz("C6")
+    fmin = librosa.note_to_hz("A1")
+    fmax = librosa.note_to_hz("C7")
 
     if use_crepe and _crepe_available():
         times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(y, sr, hop_length)
@@ -229,7 +198,7 @@ def extract_features(
     notes = _segment_notes_from_timeline(
         timeline,
         frame_duration=frame_duration,
-        min_duration=0.04,
+        min_duration=0.06,
         pitch_jump=0.6,
     )
 
