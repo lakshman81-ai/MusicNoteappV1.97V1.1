@@ -39,6 +39,10 @@ class MetaData:
     quantization_subdivisions: Optional[int] = None
     quantization_merge_gap_beats: Optional[float] = None
 
+    signal_rms_db: Optional[float] = None
+    peak_level: Optional[float] = None
+    pitch_tracker: Optional[str] = None
+
     # Legacy/auxiliary fields kept for compatibility
     tuning_offset: float = 0.0
     lufs: Optional[float] = None

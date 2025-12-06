@@ -308,6 +308,7 @@ def _segment_notes_from_timeline(
     velocity_range: tuple[int, int] = (20, 105),
     velocity_humanization: float | None = None,
     velocity_seed: int | None = None,
+    min_confidence: float = 0.12,
 ) -> List[NoteEvent]:
     """Segment notes using a voiced/unvoiced HMM with Viterbi decoding.
 
@@ -497,6 +498,8 @@ def _segment_notes_from_timeline(
         midi_value = int(round(float(np.nanmedian(midi_values))))
         pitch_hz = float(librosa.midi_to_hz(midi_value))
         confidence = float(np.mean(conf_obs[start_idx:end_idx]))
+        if confidence < min_confidence:
+            continue
         velocity = float((vel_min + vel_max) / 2.0)
         if rms is not None and rms_peak is not None and rms_peak > 0:
             note_rms = float(np.mean(rms[start_idx:end_idx]))
@@ -575,10 +578,18 @@ def extract_features(
     fmin = librosa.note_to_hz("A1")
     fmax = librosa.note_to_hz("C7")
 
-    if use_crepe and _crepe_available():
+    tracker_used = "pyin"
+    prefer_crepe = use_crepe
+    if not prefer_crepe and _crepe_available():
+        noisy_hint = meta.lufs is not None and meta.lufs < -25.0
+        stereo_hint = getattr(meta, "processing_mode", "mono") != "mono"
+        prefer_crepe = noisy_hint or stereo_hint
+
+    if prefer_crepe and _crepe_available():
         times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(
             y, sr, hop_length, fmin=fmin, fmax=fmax, voiced_threshold=crepe_voiced_threshold
         )
+        tracker_used = "crepe"
     else:
         try:
             times, f0, voiced_flag, voiced_probs = _pitch_with_pyin(
@@ -589,10 +600,14 @@ def extract_features(
                 fmax=fmax,
                 min_voiced_confidence=pyin_min_confidence,
             )
+            tracker_used = "pyin"
         except Exception:
             times, f0, voiced_flag, voiced_probs = _pitch_with_yin(
                 y, sr, hop_length, fmin=fmin, fmax=fmax
             )
+            tracker_used = "yin"
+
+    meta.pitch_tracker = tracker_used
 
     voiced_mask = (
         _apply_voicing_hysteresis(
@@ -655,6 +670,7 @@ def extract_features(
         rms_floor=rms_floor,
         velocity_humanization=velocity_humanization,
         velocity_seed=velocity_seed,
+        min_confidence=max(0.1, pyin_min_confidence),
     )
 
     chords: List[ChordEvent] = []

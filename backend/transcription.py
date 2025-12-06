@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import io
-import tempfile
 from typing import Any, Dict
 
 from music21 import converter, midi
@@ -18,13 +16,7 @@ def _musicxml_to_midi_bytes(musicxml: str) -> bytes:
 
     score = converter.parseData(musicxml)
     midi_file = midi.translate.streamToMidiFile(score)
-    with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as tmp:
-        midi_file.open(tmp.name, attrib="wb")
-        midi_file.write()
-        midi_file.close()
-        tmp.seek(0)
-        midi_bytes = tmp.read()
-    return midi_bytes
+    return midi_file.writestr()
 
 
 def transcribe_audio_pipeline(
