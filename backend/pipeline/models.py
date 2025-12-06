@@ -3,10 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any, Literal
 
-
 PitchName = Literal[
-    "C", "C#", "D", "D#", "E", "F",
-    "F#", "G", "G#", "A", "A#", "B"
+    "C",
+    "C#",
+    "D",
+    "D#",
+    "E",
+    "F",
+    "F#",
+    "G",
+    "G#",
+    "A",
+    "A#",
+    "B",
 ]
 
 
@@ -14,26 +23,33 @@ PitchName = Literal[
 
 @dataclass
 class MetaData:
-    tuning_offset: float = 0.0          # in semitones (fractional)
-    detected_key: str = "C"            # e.g. "C", "Gm"
-    lufs: float = -14.0                # integrated loudness in LUFS
-    processing_mode: str = "mono"      # "mono" | "stereo" | "polyphonic"
-    snr: float = 0.0                   # signal-to-noise estimate
-    window_size: int = 2048            # analysis window size
-    hop_length: int = 512              # analysis hop length
-    sample_rate: int = 22050           # analysis sample rate
-    tempo_bpm: float = 120.0           # global tempo estimate
-    time_signature: str = "4/4"        # default, can be improved later
+    """Container for audio and score-wide metadata."""
+
+    original_sr: Optional[int] = None
+    target_sr: int = 22050
+    sample_rate: int = 22050
+    duration_sec: float = 0.0
+    hop_length: int = 256
+    time_signature: str = "4/4"
+    tempo_bpm: Optional[float] = None
+    detected_key: Optional[str] = None
+
+    # Legacy/auxiliary fields kept for compatibility
+    tuning_offset: float = 0.0
+    lufs: Optional[float] = None
+    processing_mode: str = "mono"
+    snr: Optional[float] = None
+    window_size: int = 2048
 
 
 # ---------- Pitch timeline ----------
 
 @dataclass
 class FramePitch:
-    time: float                        # seconds
-    pitch_hz: float                    # 0.0 if unvoiced
-    midi: Optional[int]                # None if unvoiced
-    confidence: float                  # 0–1
+    time: float
+    pitch_hz: float
+    midi: Optional[int]
+    confidence: float
 
 
 # ---------- Note events ----------
@@ -56,29 +72,29 @@ class NoteEvent:
     confidence: float = 0.0
 
     # Performance-ish info
-    velocity: float = 0.8              # 0–1 (later mapped to MIDI 0–127)
+    velocity: float = 0.8
     is_grace: bool = False
-    dynamic: str = "mf"                # "p", "mf", "f", etc.
+    dynamic: str = "mf"
 
     # Musical grid (filled after quantization)
     measure: Optional[int] = None
-    beat: Optional[float] = None       # beat in measure (1.0, 1.5, etc.)
+    beat: Optional[float] = None
     duration_beats: Optional[float] = None
 
     # Extra info
     alternatives: List[AlternativePitch] = field(default_factory=list)
-    spec_thumb: Optional[str] = None   # optional spectrogram thumbnail id
+    spec_thumb: Optional[str] = None
 
 
 # ---------- Chords & layout ----------
 
 @dataclass
 class ChordEvent:
-    time: float                        # seconds
-    beat: float                        # global beat index
-    symbol: str                        # e.g. "C", "G7", "Am"
+    time: float
+    beat: float
+    symbol: str
     root: str = "C"
-    quality: str = "M"                 # "M", "m", "7", etc.
+    quality: str = "M"
 
 
 @dataclass
@@ -95,11 +111,11 @@ class AnalysisData:
     events: List[NoteEvent] = field(default_factory=list)
     chords: List[ChordEvent] = field(default_factory=list)
     vexflow_layout: VexflowLayout = field(default_factory=VexflowLayout)
+    notes: List[NoteEvent] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        JSON-serializable representation for debugging / API.
-        """
+        """JSON-serializable representation for debugging / API."""
+
         return {
             "meta": asdict(self.meta),
             "timeline": [asdict(f) for f in self.timeline],
