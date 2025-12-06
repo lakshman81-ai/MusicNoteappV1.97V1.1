@@ -94,6 +94,7 @@ def load_and_preprocess(
         tempo_bpm=None,
         detected_key=None,
         lufs=loudness,
+        preprocessed_audio=y_norm.astype(np.float32),
     )
 
     return y_norm.astype(np.float32), sr_out, meta
