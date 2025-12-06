@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import librosa
 import numpy as np
@@ -9,11 +9,10 @@ import numpy as np
 from music21 import key as m21key, meter, metadata as m21meta, note as m21note, stream, tempo
 from music21.musicxml.m21ToXml import GeneralObjectExporter
 
-from .models import NoteEvent, AnalysisData, VexflowLayout
+from .models import NoteEvent, AnalysisData, VexflowLayout, MetaData
 
 
 SIXTEENTHS_PER_BEAT = 4.0
-TARGET_SUBDIVISION_SEC = 0.125
 
 
 def _parse_time_signature(time_signature: str) -> int:
@@ -24,10 +23,10 @@ def _parse_time_signature(time_signature: str) -> int:
         return 4
 
 
-def _determine_subdivisions(tempo_bpm: float) -> int:
-    beat_duration = 60.0 / tempo_bpm
-    subdivisions = int(round(max(2.0, min(8.0, beat_duration / TARGET_SUBDIVISION_SEC))))
-    return max(1, subdivisions)
+def _determine_subdivisions(tempo_bpm: float, subdivisions_override: Optional[int] = None) -> int:
+    if subdivisions_override and subdivisions_override > 0:
+        return int(subdivisions_override)
+    return int(SIXTEENTHS_PER_BEAT)
 
 
 def _estimate_tempo_and_beats(
@@ -101,30 +100,81 @@ def _quantize_to_grid(time_value: float, grid_times: np.ndarray, grid_beats: np.
 
 
 def _quantize_events(
-    events: List[NoteEvent], tempo_bpm: float, time_signature: str, beat_times: List[float]
+    events: List[NoteEvent],
+    tempo_bpm: float,
+    time_signature: str,
+    beat_times: List[float],
+    meta: Optional[MetaData] = None,
 ) -> None:
     beats_per_measure = _parse_time_signature(time_signature)
-    subdivisions = _determine_subdivisions(tempo_bpm)
+    subdivisions_override = getattr(meta, "quantization_subdivisions", None) if meta else None
+    merge_gap_beats_override = getattr(meta, "quantization_merge_gap_beats", None) if meta else None
+
+    subdivisions = _determine_subdivisions(tempo_bpm, subdivisions_override)
     grid_times, grid_beats = _build_grid(events, tempo_bpm, beat_times, subdivisions)
 
-    for event in events:
+    beat_duration = 60.0 / tempo_bpm
+    grid_unit_sec = beat_duration / float(subdivisions)
+    grid_unit_beats = 1.0 / float(subdivisions)
+    merge_gap_beats = merge_gap_beats_override if merge_gap_beats_override is not None else (1.0 / 8.0)
+    merge_gap_sec = merge_gap_beats * beat_duration
+
+    quantized_entries = []
+    for event in sorted(events, key=lambda e: e.start_sec):
         start_quant, start_beats = _quantize_to_grid(event.start_sec, grid_times, grid_beats)
         end_quant, end_beats = _quantize_to_grid(event.end_sec, grid_times, grid_beats)
 
-        if end_quant <= start_quant:
-            end_quant = start_quant + (60.0 / tempo_bpm / subdivisions)
-            end_beats = start_beats + (1.0 / subdivisions)
+        duration_beats = max(end_beats - start_beats, grid_unit_beats)
+        duration_sec = duration_beats * beat_duration
+        min_end_sec = start_quant + grid_unit_sec
+        end_sec = max(end_quant, min_end_sec, start_quant + duration_sec)
+        duration_beats = max(duration_beats, (end_sec - start_quant) / beat_duration)
+        end_beats = start_beats + duration_beats
 
-        duration_beats = end_beats - start_beats
+        quantized_entries.append(
+            {
+                "event": event,
+                "start_sec": start_quant,
+                "end_sec": end_sec,
+                "start_beats": start_beats,
+                "end_beats": end_beats,
+                "duration_beats": duration_beats,
+            }
+        )
 
-        measure = int(start_beats // beats_per_measure) + 1
-        beat_in_measure = (start_beats % beats_per_measure) + 1.0
+    merged_entries = []
+    for entry in quantized_entries:
+        if (
+            merged_entries
+            and merged_entries[-1]["event"].midi_note == entry["event"].midi_note
+            and entry["start_sec"] - merged_entries[-1]["end_sec"] < merge_gap_sec
+        ):
+            merged = merged_entries[-1]
+            merged["end_sec"] = max(merged["end_sec"], entry["end_sec"])
+            merged_duration_beats = (merged["end_sec"] - merged["start_sec"]) / beat_duration
+            merged["duration_beats"] = max(merged_duration_beats, grid_unit_beats)
+            merged["end_beats"] = merged["start_beats"] + merged["duration_beats"]
+            continue
 
-        event.start_sec = start_quant
-        event.end_sec = end_quant
+        merged_entries.append(entry)
+
+    events.clear()
+    for entry in merged_entries:
+        duration_beats = max(entry["duration_beats"], grid_unit_beats)
+        duration_sec = duration_beats * beat_duration
+        end_sec = max(entry["end_sec"], entry["start_sec"] + duration_sec)
+        duration_beats = max(duration_beats, (end_sec - entry["start_sec"]) / beat_duration)
+
+        measure = int(entry["start_beats"] // beats_per_measure) + 1
+        beat_in_measure = (entry["start_beats"] % beats_per_measure) + 1.0
+
+        event = entry["event"]
+        event.start_sec = entry["start_sec"]
+        event.end_sec = end_sec
         event.measure = measure
         event.beat = beat_in_measure
         event.duration_beats = duration_beats
+        events.append(event)
 
 
 def _build_score(events: List[NoteEvent], tempo_bpm: float, time_signature: str, detected_key: str | None) -> stream.Score:
@@ -168,7 +218,9 @@ def quantize_and_render(
     meta.tempo_bpm = tempo_bpm
     time_signature = meta.time_signature or "4/4"
 
-    _quantize_events(events, tempo_bpm=tempo_bpm, time_signature=time_signature, beat_times=beat_times)
+    _quantize_events(
+        events, tempo_bpm=tempo_bpm, time_signature=time_signature, beat_times=beat_times, meta=meta
+    )
     analysis_data.events = events
 
     score = _build_score(events, tempo_bpm=tempo_bpm, time_signature=time_signature, detected_key=meta.detected_key)

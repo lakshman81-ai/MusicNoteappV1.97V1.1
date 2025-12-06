@@ -36,6 +36,8 @@ class MetaData:
     beat_times_override: Optional[list[float]] = None
     detected_key: Optional[str] = None
     preprocessed_audio: Optional[Any] = None
+    quantization_subdivisions: Optional[int] = None
+    quantization_merge_gap_beats: Optional[float] = None
 
     # Legacy/auxiliary fields kept for compatibility
     tuning_offset: float = 0.0
