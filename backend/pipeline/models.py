@@ -34,6 +34,7 @@ class MetaData:
     tempo_bpm: Optional[float] = None
     detected_key: Optional[str] = None
     preprocessed_audio: Optional[Any] = None
+    beat_tracking_succeeded: Optional[bool] = None
 
     # Legacy/auxiliary fields kept for compatibility
     tuning_offset: float = 0.0

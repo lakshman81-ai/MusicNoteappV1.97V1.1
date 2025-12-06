@@ -30,21 +30,24 @@ def _determine_subdivisions(tempo_bpm: float) -> int:
     return max(1, subdivisions)
 
 
-def _estimate_tempo_and_beats(meta) -> Tuple[float, List[float]]:
-    tempo_guess = meta.tempo_bpm or 120.0
+def _estimate_tempo_and_beats(meta) -> Tuple[float, List[float], bool]:
+    user_tempo = meta.tempo_bpm
+    tempo_guess = user_tempo if user_tempo is not None else 120.0
     y = getattr(meta, "preprocessed_audio", None)
     sr = getattr(meta, "sample_rate", None)
     hop_length = getattr(meta, "hop_length", 256) or 256
 
     if y is None or sr is None:
-        return tempo_guess, []
+        return tempo_guess, [], False
 
     try:
         tempo_bpm, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
         beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
-        return float(tempo_bpm), beat_times.tolist()
+        beat_times_list = beat_times.tolist()
+        tempo_used = user_tempo if user_tempo is not None else float(tempo_bpm)
+        return tempo_used, beat_times_list, bool(beat_times_list)
     except Exception:
-        return tempo_guess, []
+        return tempo_guess, [], False
 
 
 def _build_grid(
@@ -139,8 +142,9 @@ def quantize_and_render(events: List[NoteEvent], analysis_data: AnalysisData) ->
     """Quantize NoteEvents and render them to a MusicXML string."""
 
     meta = analysis_data.meta
-    tempo_bpm, beat_times = _estimate_tempo_and_beats(meta)
+    tempo_bpm, beat_times, beat_tracking_succeeded = _estimate_tempo_and_beats(meta)
     meta.tempo_bpm = tempo_bpm
+    meta.beat_tracking_succeeded = beat_tracking_succeeded
     time_signature = meta.time_signature or "4/4"
 
     _quantize_events(events, tempo_bpm=tempo_bpm, time_signature=time_signature, beat_times=beat_times)

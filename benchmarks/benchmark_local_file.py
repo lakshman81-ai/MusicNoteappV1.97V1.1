@@ -26,6 +26,8 @@ class BenchmarkCase:
     audio_path: Path
     reference_path: Path
     scenario: str
+    tempo_hint: float | None = None
+    time_signature_hint: str | None = None
 
     @property
     def slug(self) -> str:
@@ -76,7 +78,7 @@ def match_accuracy(
 
 def run_single_case(
     case: BenchmarkCase, *, use_crepe: bool = False, output_dir: Path | None = None
-) -> Dict[str, float | int | str]:
+) -> Dict[str, float | int | str | bool | None]:
     """Run transcription for a single audio/reference pair."""
 
     output_dir = output_dir or Path("benchmarks_results")
@@ -90,9 +92,15 @@ def run_single_case(
     print(f"\n🎧 Audio: {case.audio_path}")
     print(f"🎼 Reference: {case.reference_path}")
 
-    result = transcribe_audio_pipeline(str(case.audio_path), use_crepe=use_crepe)
+    result = transcribe_audio_pipeline(
+        str(case.audio_path),
+        use_crepe=use_crepe,
+        tempo_hint=case.tempo_hint,
+        time_signature_hint=case.time_signature_hint,
+    )
     musicxml_text = result["musicxml"]
     midi_bytes: bytes = result["midi_bytes"]
+    meta = result.get("meta")
 
     pred_xml_path = output_dir / f"{case.slug}_pred.musicxml"
     pred_mid_path = output_dir / f"{case.slug}_pred.mid"
@@ -106,7 +114,7 @@ def run_single_case(
     pitch_acc = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=False)
     rhythm_acc = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=True)
 
-    summary: Dict[str, float | int | str] = {
+    summary: Dict[str, float | int | str | bool | None] = {
         "name": case.name,
         "scenario": case.scenario,
         "audio": str(case.audio_path),
@@ -119,6 +127,11 @@ def run_single_case(
         "predicted_midi": str(pred_mid_path),
     }
 
+    if meta:
+        summary["tempo_bpm"] = meta.tempo_bpm
+        summary["time_signature"] = meta.time_signature
+        summary["beat_tracking_succeeded"] = meta.beat_tracking_succeeded
+
     summary_path = output_dir / f"{case.slug}_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -127,6 +140,10 @@ def run_single_case(
     print(f"Predicted notes: {len(pred_notes)}")
     print(f"Pitch accuracy:  {pitch_acc * 100:.1f}%")
     print(f"Rhythm accuracy: {rhythm_acc * 100:.1f}% (±0.25 beats)")
+    if meta:
+        tempo_display = f"{meta.tempo_bpm:.2f} BPM" if meta.tempo_bpm is not None else "unknown tempo"
+        beat_tracking_status = "succeeded" if meta.beat_tracking_succeeded else "failed"
+        print(f"Beat tracking {beat_tracking_status}; using tempo {tempo_display}.")
     print(f"Predicted MusicXML saved to: {pred_xml_path}")
     print(f"Predicted MIDI saved to: {pred_mid_path}")
     print(f"Per-clip summary saved to: {summary_path}")
@@ -271,6 +288,13 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.75, help="Fail if average pitch or rhythm accuracy falls below this value")
     parser.add_argument("--output-dir", type=Path, default=Path("benchmarks_results"), help="Where to store predictions and summaries")
     parser.add_argument("--report", type=Path, default=REPO_ROOT / "benchmarks" / "results_accuracy.md", help="Path to write the markdown results table when running the suite")
+    parser.add_argument("--tempo-hint", type=float, default=None, help="Optional tempo hint (in BPM) to guide quantization")
+    parser.add_argument(
+        "--time-signature-hint",
+        type=str,
+        default=None,
+        help="Optional time signature hint (e.g., 3/4) to guide quantization",
+    )
     args = parser.parse_args()
 
     if args.suite:
@@ -297,6 +321,8 @@ def main() -> None:
         audio_path=args.audio_path,
         reference_path=args.reference_path,
         scenario="ad-hoc",
+        tempo_hint=args.tempo_hint,
+        time_signature_hint=args.time_signature_hint,
     )
     run_single_case(case, use_crepe=args.use_crepe, output_dir=args.output_dir)
 

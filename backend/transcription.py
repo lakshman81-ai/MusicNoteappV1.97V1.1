@@ -24,7 +24,12 @@ def _musicxml_to_midi_bytes(musicxml: str) -> bytes:
     return buffer.getvalue()
 
 
-def transcribe_audio_pipeline(audio_path: str, use_crepe: bool = False) -> Dict[str, Any]:
+def transcribe_audio_pipeline(
+    audio_path: str,
+    use_crepe: bool = False,
+    tempo_hint: float | None = None,
+    time_signature_hint: str | None = None,
+) -> Dict[str, Any]:
     """
     High-level API for the transcription pipeline (Stages A→D).
 
@@ -33,6 +38,10 @@ def transcribe_audio_pipeline(audio_path: str, use_crepe: bool = False) -> Dict[
     """
 
     y, sr, meta = load_and_preprocess(audio_path)
+    if tempo_hint is not None:
+        meta.tempo_bpm = tempo_hint
+    if time_signature_hint is not None:
+        meta.time_signature = time_signature_hint
     timeline, notes, chords = extract_features(y, sr, meta, use_crepe=use_crepe)
 
     analysis_data = AnalysisData(meta=meta, timeline=timeline, events=notes, chords=chords)
