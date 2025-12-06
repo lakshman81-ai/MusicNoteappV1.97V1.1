@@ -6,7 +6,13 @@ import importlib
 import librosa
 import numpy as np
 
-from .models import MetaData, FramePitch, NoteEvent, ChordEvent
+from .models import (
+    MetaData,
+    FramePitch,
+    NoteEvent,
+    ChordEvent,
+    AlternativePitch,
+)
 
 
 def _crepe_available() -> bool:
@@ -176,6 +182,71 @@ def _smooth_midi_with_voicing(
     return smoothed
 
 
+def _estimate_polyphonic_peaks(
+    y: np.ndarray,
+    sr: int,
+    hop_length: int,
+    fmin: float,
+    fmax: float,
+    target_frames: int,
+    bins_per_octave: int = 24,
+    peak_spread_db: float = 18.0,
+    top_k: int = 3,
+) -> List[List[int]]:
+    """Estimate secondary pitch peaks per frame using a CQT front-end.
+
+    This lightweight pass is intended to surface additional stable pitch
+    candidates that often occur in polyphonic passages but are suppressed by
+    monophonic trackers (e.g., pYIN/CREPE). We only keep peaks within ``peak_spread_db``
+    of the frame maximum to avoid noise and return up to ``top_k`` MIDI candidates
+    per frame.
+    """
+
+    n_bins = int(np.ceil(12 * np.log2(fmax / fmin))) + 1
+    cqt = librosa.cqt(
+        y,
+        sr=sr,
+        hop_length=hop_length,
+        fmin=fmin,
+        n_bins=n_bins,
+        bins_per_octave=bins_per_octave,
+        pad_mode="reflect",
+    )
+
+    mags_db = librosa.amplitude_to_db(np.abs(cqt) + 1e-6, ref=np.max)
+    fmin_midi = float(librosa.hz_to_midi(fmin))
+    step = 12.0 / bins_per_octave
+
+    frame_peaks: List[List[int]] = []
+    for frame_idx in range(mags_db.shape[1]):
+        frame = mags_db[:, frame_idx]
+        if not np.any(np.isfinite(frame)):
+            frame_peaks.append([])
+            continue
+
+        max_db = float(np.max(frame))
+        threshold = max_db - peak_spread_db
+        candidate_idx = np.where(frame >= threshold)[0]
+        if candidate_idx.size == 0:
+            frame_peaks.append([])
+            continue
+
+        sorted_idx = candidate_idx[np.argsort(frame[candidate_idx])[::-1]]
+        unique_midis: List[int] = []
+        for idx in sorted_idx[:top_k * 2]:
+            midi_val = int(round(fmin_midi + idx * step))
+            if midi_val in unique_midis:
+                continue
+            unique_midis.append(midi_val)
+            if len(unique_midis) >= top_k:
+                break
+        frame_peaks.append(unique_midis)
+
+    if len(frame_peaks) < target_frames:
+        frame_peaks.extend([[] for _ in range(target_frames - len(frame_peaks))])
+    return frame_peaks[:target_frames]
+
+
 def _build_timeline(
     times: np.ndarray,
     f0: np.ndarray,
@@ -216,6 +287,7 @@ def _segment_notes_from_timeline(
     max_duration: float | None = 8.0,
     rest_threshold: float = 0.08,
     median_window: int = 5,
+    alt_pitch_frames: List[List[int]] | None = None,
 ) -> List[NoteEvent]:
     """Segment notes using a voiced/unvoiced HMM with Viterbi decoding.
 
@@ -397,6 +469,17 @@ def _segment_notes_from_timeline(
         midi_value = int(round(float(np.nanmedian(midi_values))))
         pitch_hz = float(librosa.midi_to_hz(midi_value))
         confidence = float(np.mean(conf_obs[start_idx:end_idx]))
+        alternatives: List[AlternativePitch] = []
+        if alt_pitch_frames is not None and alt_pitch_frames:
+            window_alts = [p for frame in alt_pitch_frames[start_idx:end_idx] for p in frame if p != midi_value]
+            if window_alts:
+                unique, counts = np.unique(window_alts, return_counts=True)
+                coverage = counts / max(1, end_idx - start_idx)
+                for alt_midi, cov in sorted(zip(unique, coverage), key=lambda x: x[1], reverse=True):
+                    if cov < 0.35:
+                        continue
+                    alternatives.append(AlternativePitch(midi=int(alt_midi), confidence=float(min(1.0, cov))))
+
         candidate_notes.append(
             NoteEvent(
                 start_sec=float(start_time),
@@ -404,6 +487,7 @@ def _segment_notes_from_timeline(
                 midi_note=midi_value,
                 pitch_hz=pitch_hz,
                 confidence=confidence,
+                alternatives=alternatives,
             )
         )
 
@@ -462,6 +546,15 @@ def extract_features(
     )
     midi_smoothed = _smooth_midi_with_voicing(refined_f0, voiced_probs)
 
+    alt_pitch_frames = _estimate_polyphonic_peaks(
+        y,
+        sr,
+        hop_length,
+        fmin,
+        fmax,
+        target_frames=len(times),
+    )
+
     timeline = _build_timeline(
         times,
         refined_f0,
@@ -485,6 +578,7 @@ def extract_features(
         max_duration=8.0,
         rest_threshold=0.08,
         median_window=5,
+        alt_pitch_frames=alt_pitch_frames,
     )
 
     chords: List[ChordEvent] = []
