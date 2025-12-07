@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Any, Literal, Tuple
 
 PitchName = Literal[
     "C",
@@ -49,6 +49,9 @@ class MetaData:
     processing_mode: str = "mono"
     snr: Optional[float] = None
     window_size: int = 2048
+    channel_orientation: str = "unknown"
+    original_shape: Optional[Tuple[int, ...]] = None
+    normalized_shape: Optional[Tuple[int, ...]] = None
 
 
 # ---------- Pitch timeline ----------
