@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import importlib
+import os
+import tempfile
 from typing import List, Tuple
 
 import librosa
 import numpy as np
 from sklearn.cluster import KMeans
 from music21 import note as m21note, stream
+import soundfile as sf
 
 from .models import (
     MetaData,
@@ -19,6 +22,10 @@ from .models import (
 
 def _crepe_available() -> bool:
     return importlib.util.find_spec("crepe") is not None
+
+
+def _basic_pitch_available() -> bool:
+    return importlib.util.find_spec("basic_pitch") is not None
 
 
 def _pitch_with_pyin(

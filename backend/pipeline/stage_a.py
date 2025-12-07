@@ -36,6 +36,24 @@ def _to_mono(y: np.ndarray) -> np.ndarray:
     return np.mean(y, axis=1, dtype=np.float32)
 
 
+def _normalize_channel_orientation(y: np.ndarray) -> tuple[np.ndarray, str, bool]:
+    """Ensure multi-channel audio is shaped as (samples, channels).
+
+    Some loaders (e.g., ``librosa.load`` with ``mono=False``) return arrays shaped
+    as ``(channels, samples)``. This function transposes those arrays so that
+    downstream stereo processing receives the canonical ``(samples, channels)``
+    layout.
+    """
+
+    if y.ndim != 2:
+        return y.astype(np.float32), "mono", False
+
+    channels_first = y.shape[0] < y.shape[1] and y.shape[0] <= 8
+    if channels_first:
+        return y.T.astype(np.float32), "channels_first", True
+    return y.astype(np.float32), "samples_first", False
+
+
 def _trim_silence(y: np.ndarray, top_db: float = 40.0) -> np.ndarray:
     """Trim leading and trailing silence using an energy threshold."""
 
@@ -130,6 +148,10 @@ def load_and_preprocess(
     audio_path = str(Path(audio_path))
     y, original_sr = _load_audio(audio_path)
 
+    input_shape = tuple(y.shape)
+    y, orientation, transposed = _normalize_channel_orientation(y)
+    normalized_shape = tuple(y.shape)
+
     if y.size == 0:
         raise ValueError("Loaded audio is empty")
 
@@ -195,5 +217,8 @@ def load_and_preprocess(
     meta.processing_mode = processing_mode
     meta.window_size = window_size
     meta.tuning_offset = tuning_offset
+    meta.channel_orientation = orientation if not transposed else "samples_first"
+    meta.original_shape = input_shape
+    meta.normalized_shape = normalized_shape
 
     return y_norm.astype(np.float32), sr_out, meta
