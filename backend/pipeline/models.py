@@ -82,8 +82,11 @@ class NoteEvent:
 
     # Performance-ish info
     velocity: float = 0.8
+    amplitude: float = 0.0
     is_grace: bool = False
     dynamic: str = "mf"
+    voice: Optional[str] = None
+    articulation: Optional[str] = None
 
     # Musical grid (filled after quantization)
     measure: Optional[int] = None
@@ -140,8 +143,11 @@ class AnalysisData:
                     "pitch_hz": e.pitch_hz,
                     "confidence": e.confidence,
                     "velocity": e.velocity,
+                    "amplitude": e.amplitude,
                     "is_grace": e.is_grace,
                     "dynamic": e.dynamic,
+                    "voice": e.voice,
+                    "articulation": e.articulation,
                     "measure": e.measure,
                     "beat": e.beat,
                     "duration_beats": e.duration_beats,

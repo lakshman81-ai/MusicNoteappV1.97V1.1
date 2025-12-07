@@ -22,6 +22,9 @@ def _musicxml_to_midi_bytes(musicxml: str) -> bytes:
 def transcribe_audio_pipeline(
     audio_path: str,
     use_crepe: bool = False,
+    stereo_mode: bool = False,
+    start_offset: float = 0.0,
+    max_duration: float | None = None,
     tempo_override: float | None = None,
     beat_times_override: list[float] | None = None,
     velocity_humanization: float | None = None,
@@ -34,7 +37,9 @@ def transcribe_audio_pipeline(
     and quantized note events for downstream consumers.
     """
 
-    y, sr, meta = load_and_preprocess(audio_path)
+    y, sr, meta = load_and_preprocess(
+        audio_path, stereo_mode=stereo_mode, start_offset=start_offset, max_duration=max_duration
+    )
     meta.tempo_override = tempo_override
     meta.tempo_bpm = tempo_override or meta.tempo_bpm
     meta.beat_times_override = beat_times_override
@@ -71,6 +76,9 @@ def transcribe_audio_pipeline(
 def transcribe_audio(
     audio_path: str,
     use_crepe: bool = False,
+    stereo_mode: bool = False,
+    start_offset: float = 0.0,
+    max_duration: float | None = None,
     tempo_override: float | None = None,
     beat_times_override: list[float] | None = None,
     velocity_humanization: float | None = None,
@@ -81,6 +89,9 @@ def transcribe_audio(
     result = transcribe_audio_pipeline(
         audio_path,
         use_crepe=use_crepe,
+        stereo_mode=stereo_mode,
+        start_offset=start_offset,
+        max_duration=max_duration,
         tempo_override=tempo_override,
         beat_times_override=beat_times_override,
         velocity_humanization=velocity_humanization,
