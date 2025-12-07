@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import List, Tuple
 import importlib
+from typing import List, Tuple
 
 import librosa
 import numpy as np
+from sklearn.cluster import KMeans
+from music21 import note as m21note, stream
 
 from .models import (
     MetaData,
@@ -42,27 +44,6 @@ def _pitch_with_pyin(
     voiced_probs = np.where(
         voiced_flag, np.maximum(voiced_probs, min_voiced_confidence), unvoiced_confidence
     )
-    times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
-    return times, f0, voiced_flag, voiced_probs
-
-
-def _pitch_with_yin(
-    y: np.ndarray,
-    sr: int,
-    hop_length: int,
-    fmin: float,
-    fmax: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    f0 = librosa.yin(
-        y,
-        fmin=fmin,
-        fmax=fmax,
-        sr=sr,
-        frame_length=2048,
-        hop_length=hop_length,
-    )
-    voiced_flag = np.isfinite(f0) & (f0 > 0)
-    voiced_probs = np.where(voiced_flag, 0.5, 0.0)
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
     return times, f0, voiced_flag, voiced_probs
 
@@ -197,6 +178,54 @@ def _smooth_midi_with_voicing(
     return smoothed
 
 
+def _run_basic_pitch(y: np.ndarray, sr: int) -> Tuple[List[FramePitch], List[NoteEvent]]:
+    """Run Basic-Pitch if installed; raises on failure so the caller can fallback."""
+
+    if not _basic_pitch_available():
+        raise RuntimeError("basic_pitch not available")
+
+    basic_pitch = importlib.import_module("basic_pitch.inference")
+    icassp_path = importlib.import_module("basic_pitch").ICASSP2022_MODEL_PATH
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        sf.write(tmp.name, y, sr)
+        tmp_path = tmp.name
+
+    try:
+        outputs, _, _ = basic_pitch.predict([tmp_path], model_path=icassp_path, output_prediction=False)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    note_events = outputs[0]["note_events"] if outputs else []
+    timeline: List[FramePitch] = []
+    notes: List[NoteEvent] = []
+    for start, end, midi_note, amplitude in note_events:
+        pitch_hz = float(librosa.midi_to_hz(midi_note))
+        notes.append(
+            NoteEvent(
+                start_sec=float(start),
+                end_sec=float(end),
+                midi_note=int(midi_note),
+                pitch_hz=pitch_hz,
+                confidence=float(amplitude),
+                velocity=float(np.clip(amplitude, 0.0, 1.0) * 105.0),
+                amplitude=float(np.clip(amplitude, 0.0, 1.0)),
+            )
+        )
+        timeline.append(
+            FramePitch(
+                time=float(start),
+                pitch_hz=pitch_hz,
+                midi=int(midi_note),
+                confidence=float(np.clip(amplitude, 0.0, 1.0)),
+            )
+        )
+    return timeline, notes
+
+
 def _estimate_polyphonic_peaks(
     y: np.ndarray,
     sr: int,
@@ -260,6 +289,72 @@ def _estimate_polyphonic_peaks(
     if len(frame_peaks) < target_frames:
         frame_peaks.extend([[] for _ in range(target_frames - len(frame_peaks))])
     return frame_peaks[:target_frames]
+
+
+def _assign_voices(notes: List[NoteEvent]) -> List[NoteEvent]:
+    if len(notes) < 2:
+        for note in notes:
+            note.voice = "voice1"
+        return notes
+
+    pitches = np.array([n.midi_note for n in notes], dtype=float).reshape(-1, 1)
+    try:
+        clusters = KMeans(n_clusters=2, n_init="auto", random_state=0).fit_predict(pitches)
+        centers = np.array([pitches[clusters == i].mean() for i in range(2)])
+    except Exception:
+        for note in notes:
+            note.voice = "voice1"
+        return notes
+
+    ordering = np.argsort(centers)
+    label_to_voice = {ordering[1]: "voice1", ordering[0]: "voice2"}
+    for label, note in zip(clusters, notes):
+        note.voice = label_to_voice.get(label, "voice1")
+    return notes
+
+
+def _detect_chords_from_chroma(
+    y: np.ndarray, sr: int, hop_length: int, tempo_bpm: float | None = None
+) -> List[ChordEvent]:
+    chords: List[ChordEvent] = []
+    try:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    except Exception:
+        return chords
+
+    frames_per_second = max(1, int(round(sr / hop_length)))
+    major_template = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0], dtype=float)
+    minor_template = np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0], dtype=float)
+
+    for start_frame in range(0, chroma.shape[1], frames_per_second):
+        end_frame = min(chroma.shape[1], start_frame + frames_per_second)
+        window = chroma[:, start_frame:end_frame]
+        if window.size == 0:
+            continue
+        profile = np.mean(window, axis=1)
+        best_score = -np.inf
+        best_root = None
+        best_quality = None
+        for root in range(12):
+            rolled_major = np.roll(major_template, root)
+            rolled_minor = np.roll(minor_template, root)
+            score_major = float(np.dot(profile, rolled_major))
+            score_minor = float(np.dot(profile, rolled_minor))
+            if score_major > best_score:
+                best_score = score_major
+                best_root = librosa.midi_to_note(60 + root)[0:-1]
+                best_quality = "maj"
+            if score_minor > best_score:
+                best_score = score_minor
+                best_root = librosa.midi_to_note(60 + root)[0:-1]
+                best_quality = "min"
+        if best_root is None or best_quality is None:
+            continue
+        time_sec = float(librosa.frames_to_time(start_frame, sr=sr, hop_length=hop_length))
+        beat_val = float(time_sec * (tempo_bpm or 120.0) / 60.0)
+        symbol = f"{best_root}{'' if best_quality == 'maj' else 'm'}"
+        chords.append(ChordEvent(time=time_sec, beat=beat_val, symbol=symbol, root=best_root, quality=best_quality))
+    return chords
 
 
 def _build_timeline(
@@ -501,11 +596,13 @@ def _segment_notes_from_timeline(
         if confidence < min_confidence:
             continue
         velocity = float((vel_min + vel_max) / 2.0)
+        amplitude_norm = 0.5
         if rms is not None and rms_peak is not None and rms_peak > 0:
             note_rms = float(np.mean(rms[start_idx:end_idx]))
             floor = rms_floor if rms_floor is not None else 0.0
             norm = np.clip((note_rms - floor) / max(rms_peak - floor, 1e-6), 0.0, 1.0)
             velocity = float(vel_min + norm * (vel_max - vel_min))
+            amplitude_norm = float(norm)
         if humanize_amount is not None and rng is not None:
             velocity += float(rng.uniform(-humanize_amount, humanize_amount))
         velocity = float(np.clip(velocity, vel_min, vel_max))
@@ -528,6 +625,7 @@ def _segment_notes_from_timeline(
                 pitch_hz=pitch_hz,
                 confidence=confidence,
                 velocity=velocity,
+                amplitude=amplitude_norm,
                 alternatives=alternatives,
             )
         )
@@ -549,11 +647,47 @@ def _segment_notes_from_timeline(
                 pitch_hz=float(librosa.midi_to_hz(last.midi_note)),
                 confidence=float((last.confidence + note.confidence) / 2.0),
                 velocity=float((last.velocity + note.velocity) / 2.0),
+                amplitude=float((last.amplitude + note.amplitude) / 2.0),
             )
         else:
             merged_notes.append(note)
 
     return merged_notes
+
+
+def _mark_attacks(notes: List[NoteEvent], y: np.ndarray, sr: int, hop_length: int) -> List[NoteEvent]:
+    try:
+        flux = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    except Exception:
+        flux = np.array([])
+    if flux.size == 0:
+        for note in notes:
+            note.articulation = "legato"
+        return notes
+
+    times = librosa.times_like(flux, sr=sr, hop_length=hop_length)
+    threshold = float(np.percentile(flux, 70)) if flux.size else 0.0
+    for note in notes:
+        start_frame = int(np.argmin(np.abs(times - note.start_sec))) if times.size else 0
+        energy = float(flux[start_frame]) if start_frame < flux.size else 0.0
+        note.articulation = "articulated" if energy >= threshold else "legato"
+    return notes
+
+
+def _detect_key_signature(notes: List[NoteEvent]) -> str | None:
+    if not notes:
+        return None
+    s = stream.Stream()
+    for n in notes:
+        m_note = m21note.Note(n.midi_note)
+        duration_qL = float(n.duration_beats or max((n.end_sec - n.start_sec) * 2.0, 0.25))
+        m_note.quarterLength = max(duration_qL, 0.25)
+        s.append(m_note)
+    try:
+        key_obj = s.analyze("key")
+        return key_obj.tonic.name + ("m" if key_obj.mode == "minor" else "")
+    except Exception:
+        return None
 
 
 def extract_features(
@@ -578,43 +712,79 @@ def extract_features(
     fmin = librosa.note_to_hz("A1")
     fmax = librosa.note_to_hz("C7")
 
-    tracker_used = "pyin"
-    prefer_crepe = use_crepe
-    if not prefer_crepe and _crepe_available():
-        noisy_hint = meta.lufs is not None and meta.lufs < -25.0
-        stereo_hint = getattr(meta, "processing_mode", "mono") != "mono"
-        prefer_crepe = noisy_hint or stereo_hint
+    tracker_used = "unknown"
+    timeline: List[FramePitch] = []
+    notes: List[NoteEvent] = []
 
-    if prefer_crepe and _crepe_available():
-        times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(
-            y, sr, hop_length, fmin=fmin, fmax=fmax, voiced_threshold=crepe_voiced_threshold
-        )
-        tracker_used = "crepe"
-    else:
+    analysis_success = False
+    times = f0 = voiced_flag = voiced_probs = None
+
+    prefer_crepe = use_crepe or _crepe_available()
+    if prefer_crepe:
         try:
+            times, f0, voiced_flag, voiced_probs = _pitch_with_crepe(
+                y, sr, hop_length, fmin=fmin, fmax=fmax, voiced_threshold=crepe_voiced_threshold
+            )
+            tracker_used = "crepe"
+            analysis_success = True
+
+            try:
+                y_harm, _ = librosa.effects.hpss(y)
+                py_times, py_f0, _, py_probs = _pitch_with_pyin(
+                    y_harm,
+                    sr,
+                    hop_length,
+                    fmin=fmin,
+                    fmax=fmax,
+                    min_voiced_confidence=max(pyin_min_confidence, 0.05),
+                )
+                py_probs = np.nan_to_num(py_probs, nan=0.0)
+                py_f0_interp = np.interp(
+                    times, py_times, np.nan_to_num(py_f0, nan=0.0), left=np.nan, right=np.nan
+                )
+                py_prob_interp = np.interp(times, py_times, py_probs, left=0.0, right=0.0)
+                low_conf_mask = voiced_probs < crepe_voiced_threshold
+                f0 = np.where(low_conf_mask, py_f0_interp, f0)
+                voiced_flag = (voiced_probs >= crepe_voiced_threshold) | (
+                    (py_prob_interp >= pyin_min_confidence) & np.isfinite(py_f0_interp)
+                )
+                voiced_probs = np.where(low_conf_mask, py_prob_interp, voiced_probs)
+            except Exception:
+                pass
+        except Exception:
+            analysis_success = False
+
+    if not analysis_success:
+        try:
+            y_harm, _ = librosa.effects.hpss(y)
             times, f0, voiced_flag, voiced_probs = _pitch_with_pyin(
-                y,
+                y_harm,
                 sr,
                 hop_length,
                 fmin=fmin,
                 fmax=fmax,
-                min_voiced_confidence=pyin_min_confidence,
+                min_voiced_confidence=max(pyin_min_confidence, 0.05),
             )
-            tracker_used = "pyin"
+            tracker_used = "hpss-pyin"
+            analysis_success = True
         except Exception:
-            times, f0, voiced_flag, voiced_probs = _pitch_with_yin(
-                y, sr, hop_length, fmin=fmin, fmax=fmax
-            )
-            tracker_used = "yin"
+            pass
 
-    meta.pitch_tracker = tracker_used
-
-    voiced_mask = (
-        _apply_voicing_hysteresis(
-            voiced_probs, on_threshold=voicing_on_threshold, off_threshold=voicing_off_threshold
+    if not analysis_success:
+        times, f0, voiced_flag, voiced_probs = _pitch_with_pyin(
+            y,
+            sr,
+            hop_length,
+            fmin=fmin,
+            fmax=fmax,
+            min_voiced_confidence=pyin_min_confidence,
         )
-        & voiced_flag
-    )
+        tracker_used = "pyin"
+        analysis_success = True
+
+    voiced_mask = _apply_voicing_hysteresis(
+        voiced_probs, on_threshold=voicing_on_threshold, off_threshold=voicing_off_threshold
+    ) & voiced_flag
     refined_f0 = _harmonic_summation_refine(
         y, sr, hop_length, times, f0, voiced_mask, n_fft=2048, harmonics=4
     )
@@ -625,7 +795,7 @@ def extract_features(
         smoothing_window=smoothing_window,
     )
 
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop_length)[0]
+    rms = librosa.feature.rms(y=y, frame_length=meta.window_size or 2048, hop_length=hop_length)[0]
     alt_pitch_frames = _estimate_polyphonic_peaks(
         y,
         sr,
@@ -673,5 +843,11 @@ def extract_features(
         min_confidence=max(0.1, pyin_min_confidence),
     )
 
-    chords: List[ChordEvent] = []
+    meta.pitch_tracker = tracker_used
+
+    notes = _assign_voices(notes)
+    chords = _detect_chords_from_chroma(y, sr, hop_length, tempo_bpm=meta.tempo_bpm)
+    notes = _mark_attacks(notes, y, sr, hop_length)
+    meta.detected_key = meta.detected_key or _detect_key_signature(notes)
+
     return timeline, notes, chords

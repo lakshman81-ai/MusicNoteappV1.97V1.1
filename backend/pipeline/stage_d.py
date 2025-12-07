@@ -13,6 +13,7 @@ from .models import NoteEvent, AnalysisData, VexflowLayout, MetaData
 
 
 SIXTEENTHS_PER_BEAT = 4.0
+CANDIDATE_GRIDS = [4, 3, 5, 7]
 
 
 def _parse_time_signature(time_signature: str) -> int:
@@ -27,6 +28,34 @@ def _determine_subdivisions(tempo_bpm: float, subdivisions_override: Optional[in
     if subdivisions_override and subdivisions_override > 0:
         return int(subdivisions_override)
     return int(SIXTEENTHS_PER_BEAT)
+
+
+def _select_best_subdivision(
+    events: List[NoteEvent],
+    tempo_bpm: float,
+    beat_times: List[float],
+    candidates: List[int],
+    time_signature: str,
+    fallback: int,
+) -> int:
+    best_choice = fallback
+    best_error = float("inf")
+
+    for subdivisions in candidates:
+        grid_times, grid_beats = _build_grid(events, tempo_bpm, beat_times, subdivisions)
+        error = 0.0
+        for event in events:
+            start_quant, _ = _quantize_to_grid(event.start_sec, grid_times, grid_beats)
+            end_quant, _ = _quantize_to_grid(event.end_sec, grid_times, grid_beats)
+            error += (start_quant - event.start_sec) ** 2 + (end_quant - event.end_sec) ** 2
+        # penalize grids that are too coarse for the meter
+        if _parse_time_signature(time_signature) > 3 and subdivisions < 3:
+            error *= 1.1
+        if error < best_error:
+            best_error = error
+            best_choice = subdivisions
+
+    return best_choice
 
 
 def _estimate_tempo_and_beats(
@@ -110,7 +139,13 @@ def _quantize_events(
     subdivisions_override = getattr(meta, "quantization_subdivisions", None) if meta else None
     merge_gap_beats_override = getattr(meta, "quantization_merge_gap_beats", None) if meta else None
 
-    subdivisions = _determine_subdivisions(tempo_bpm, subdivisions_override)
+    base_subdivisions = _determine_subdivisions(tempo_bpm, subdivisions_override)
+    candidate_grids = list(CANDIDATE_GRIDS)
+    if subdivisions_override and subdivisions_override not in candidate_grids:
+        candidate_grids.append(int(subdivisions_override))
+    subdivisions = _select_best_subdivision(
+        events, tempo_bpm, beat_times, candidate_grids, time_signature, base_subdivisions
+    )
     grid_times, grid_beats = _build_grid(events, tempo_bpm, beat_times, subdivisions)
 
     beat_duration = 60.0 / tempo_bpm
@@ -183,23 +218,31 @@ def _build_score(events: List[NoteEvent], tempo_bpm: float, time_signature: str,
     score.metadata.title = "Analyzed Audio"
     score.metadata.composer = "Music-Note-Creator"
 
-    part = stream.Part()
-    part.id = "P1"
-    part.append(tempo.MetronomeMark(number=tempo_bpm))
-    part.append(meter.TimeSignature(time_signature))
+    treble = stream.Part()
+    treble.id = "P1"
+    bass = stream.Part()
+    bass.id = "P2"
 
-    if detected_key:
-        part.append(m21key.Key(detected_key))
+    for part in (treble, bass):
+        part.append(tempo.MetronomeMark(number=tempo_bpm))
+        part.append(meter.TimeSignature(time_signature))
+        if detected_key:
+            part.append(m21key.Key(detected_key))
 
     for event in sorted(events, key=lambda e: e.start_sec):
         n = m21note.Note(event.midi_note)
         ql = float(event.duration_beats or 0.25)
         n.quarterLength = max(ql, 0.25)
         offset = float((event.measure - 1) * _parse_time_signature(time_signature) + ((event.beat or 1.0) - 1.0))
-        part.insert(offset, n)
+        target_part = bass if getattr(event, "voice", "voice1") == "voice2" else treble
+        target_part.insert(offset, n)
 
-    part.makeMeasures(inPlace=True)
-    score.insert(0, part)
+    treble.makeMeasures(inPlace=True)
+    bass.makeMeasures(inPlace=True)
+
+    score.insert(0, treble)
+    if len(bass.notes):
+        score.insert(0, bass)
     return score
 
 
@@ -231,7 +274,10 @@ def quantize_and_render(
 
     score = _build_score(events, tempo_bpm=tempo_bpm, time_signature=time_signature, detected_key=meta.detected_key)
 
-    measures = [{"number": int(m.number)} for m in score.parts[0].getElementsByClass("Measure")]
+    measures = []
+    for part in score.parts:
+        for m in part.getElementsByClass("Measure"):
+            measures.append({"number": int(m.number), "part": part.id})
     analysis_data.vexflow_layout = VexflowLayout(measures=measures)
 
     exporter = GeneralObjectExporter()

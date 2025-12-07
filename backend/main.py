@@ -35,7 +35,12 @@ async def transcribe(
             tmp.write(await file.read())
 
         try:
-            result = transcribe_audio_pipeline(tmp_path)
+            result = transcribe_audio_pipeline(
+                tmp_path,
+                stereo_mode=stereo_mode,
+                start_offset=start_offset,
+                max_duration=max_duration,
+            )
             xml_bytes = result["musicxml"].encode("utf-8")
             return Response(content=xml_bytes, media_type="application/xml")
         finally:

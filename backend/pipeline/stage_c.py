@@ -10,13 +10,32 @@ def apply_theory(
     analysis_data: AnalysisData,
 ) -> List[NoteEvent]:
     """
-    Stage C: placeholder theory layer.
+    Stage C: music-theory post-processing.
 
-    This implementation is intentionally non-destructive: it preserves the
-    original timing and pitches while optionally attaching the events to the
-    provided AnalysisData container.
+    - Detects grace notes (short pickups into grid-aligned notes) and marks them
+      as non-counting events.
+    - Maps captured amplitude (0.0–1.0) to expressive dynamics.
+    - Leaves enharmonic spelling to the key-aware MusicXML projection stage.
     """
 
-    analysis_data.events = events
-    analysis_data.notes = events
-    return events
+    def _map_dynamic(amplitude: float) -> str:
+        if amplitude < 0.25:
+            return "p"
+        if amplitude < 0.5:
+            return "mp"
+        if amplitude < 0.75:
+            return "mf"
+        return "f"
+
+    events_sorted = sorted(events, key=lambda n: n.start_sec)
+    for idx, note in enumerate(events_sorted):
+        duration = float(note.end_sec - note.start_sec)
+        if duration < 0.1 and idx + 1 < len(events_sorted):
+            next_note = events_sorted[idx + 1]
+            if next_note.start_sec - note.end_sec < 0.12:
+                note.is_grace = True
+        note.dynamic = _map_dynamic(getattr(note, "amplitude", 0.0))
+
+    analysis_data.events = events_sorted
+    analysis_data.notes = events_sorted
+    return events_sorted
