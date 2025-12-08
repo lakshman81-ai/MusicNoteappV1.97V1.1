@@ -56,6 +56,34 @@ class MatchMetrics:
     predicted_total: int
 
 
+@dataclass
+class SuiteRunResult:
+    """Captures the outcome of a suite run."""
+
+    exit_code: int
+    summary: Dict[str, object]
+    strategy_label: str | None = None
+
+
+@dataclass
+class AgentStrategy:
+    """Defines a strategy to try while iterating toward the accuracy target."""
+
+    name: str
+    use_crepe: bool
+    tempo_override: float | None = None
+    beat_times_override: List[float] | None = None
+
+    def describe(self) -> str:
+        parts = [self.name]
+        parts.append("crepe" if self.use_crepe else "pyin/yin")
+        if self.tempo_override is not None:
+            parts.append(f"{self.tempo_override:.0f} bpm")
+        if self.beat_times_override:
+            parts.append(f"{len(self.beat_times_override)} beat anchors")
+        return " | ".join(parts)
+
+
 def extract_notes(score_path: Path) -> List[NoteTuple]:
     score = converter.parse(str(score_path))
     notes: List[NoteTuple] = []
@@ -172,7 +200,6 @@ def run_single_case(
 
     output_dir = output_dir or Path("benchmarks_results")
     output_dir.mkdir(exist_ok=True)
-
     if not case.audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {case.audio_path}")
     if not case.reference_path.exists():
@@ -271,9 +298,13 @@ def run_suite(
     report_path: Path | None = None,
     tempo_override: float | None = None,
     beat_times_override: List[float] | None = None,
-) -> int:
+    strategy_label: str | None = None,
+) -> SuiteRunResult:
     output_dir = output_dir or Path("benchmarks_results")
     output_dir.mkdir(exist_ok=True)
+
+    if strategy_label:
+        print(f"Applying strategy: {strategy_label}")
 
     summaries = [
         run_single_case(
@@ -303,6 +334,7 @@ def run_suite(
         "average_rhythm_f1": avg_rhythm_f1,
         "threshold": threshold,
         "cases": summaries,
+        "strategy_label": strategy_label or "default",
     }
 
     aggregate_path = output_dir / "accuracy_suite_summary.json"
@@ -327,14 +359,15 @@ def run_suite(
         write_markdown_report(suite_summary, report_path)
         print(f"Markdown report saved to: {report_path}")
 
+    exit_code = 0
     if avg_pitch_f1 < threshold or avg_rhythm_f1 < threshold:
         print(
             f"Suite accuracy below threshold ({threshold*100:.0f}%). "
             "Failing with non-zero exit code."
         )
-        return 1
+        exit_code = 1
 
-    return 0
+    return SuiteRunResult(exit_code=exit_code, summary=suite_summary, strategy_label=strategy_label)
 
 
 def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -> None:
@@ -451,6 +484,153 @@ def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -
     report_path.write_text("\n".join(header + rows + footer) + "\n", encoding="utf-8")
 
 
+def _parse_tempos(raw: str | None) -> List[float | None]:
+    if not raw:
+        return [None, 92.0, 100.0, 120.0]
+
+    parsed: List[float | None] = []
+    for item in raw.split(","):
+        stripped = item.strip()
+        if not stripped:
+            continue
+        if stripped.lower() == "auto":
+            parsed.append(None)
+            continue
+        try:
+            parsed.append(float(stripped))
+        except ValueError as exc:  # pragma: no cover - argparse guards input
+            raise ValueError(f"Invalid tempo value: {stripped}") from exc
+    return parsed or [None]
+
+
+def build_agent_strategies(
+    *,
+    base_use_crepe: bool,
+    tempos: List[float | None],
+    prioritize_crepe: bool,
+) -> List[AgentStrategy]:
+    seen: set[tuple[bool, float | None]] = set()
+    strategies: List[AgentStrategy] = []
+
+    def _add(name: str, use_crepe: bool, tempo_override: float | None) -> None:
+        key = (use_crepe, tempo_override)
+        if key in seen:
+            return
+        seen.add(key)
+        strategies.append(
+            AgentStrategy(
+                name=name,
+                use_crepe=use_crepe,
+                tempo_override=tempo_override,
+                beat_times_override=None,
+            )
+        )
+
+    tempo_labels = {
+        None: "auto tempo",
+    }
+
+    ordered_tempos = tempos or [None]
+    # Optionally front-load CREPE strategies to chase accuracy sooner.
+    if prioritize_crepe:
+        for tempo in ordered_tempos:
+            _add(f"crepe @ {tempo_labels.get(tempo, f'{tempo:.0f} bpm')}", True, tempo)
+
+    for tempo in ordered_tempos:
+        _add(f"baseline @ {tempo_labels.get(tempo, f'{tempo:.0f} bpm')}", base_use_crepe, tempo)
+
+    # If CREPE was not prioritized but differs from baseline, try it afterward.
+    if not prioritize_crepe and not base_use_crepe:
+        for tempo in ordered_tempos:
+            _add(f"crepe @ {tempo_labels.get(tempo, f'{tempo:.0f} bpm')}", True, tempo)
+
+    return strategies
+
+
+def run_agent_mode(
+    cases: Iterable[BenchmarkCase],
+    *,
+    output_dir: Path,
+    target_accuracy: float,
+    max_runs: int,
+    tempos: List[float | None],
+    base_use_crepe: bool,
+    prioritize_crepe: bool,
+    report_path: Path | None,
+    beat_times_override: List[float] | None,
+) -> int:
+    strategies = build_agent_strategies(
+        base_use_crepe=base_use_crepe,
+        tempos=tempos,
+        prioritize_crepe=prioritize_crepe,
+    )
+
+    if max_runs > 0:
+        strategies = strategies[:max_runs]
+
+    print(
+        f"Starting agent mode with {len(strategies)} strategy candidates "
+        f"(target F1 ≥ {target_accuracy*100:.1f}%)."
+    )
+
+    history: List[Dict[str, object]] = []
+    reached_target = False
+
+    for idx, strategy in enumerate(strategies, start=1):
+        print(f"\n🤖 Agent iteration {idx}/{len(strategies)}: {strategy.describe()}")
+        iter_report_path = None
+        if report_path:
+            iter_report_path = report_path.with_name(
+                f"{report_path.stem}_agent_{idx}{report_path.suffix}"
+            )
+
+        suite_result = run_suite(
+            cases,
+            use_crepe=strategy.use_crepe,
+            output_dir=output_dir,
+            threshold=target_accuracy,
+            report_path=iter_report_path,
+            tempo_override=strategy.tempo_override,
+            beat_times_override=beat_times_override,
+            strategy_label=strategy.name,
+        )
+
+        summary = suite_result.summary
+        history.append(
+            {
+                "iteration": idx,
+                "strategy": strategy.describe(),
+                "average_pitch_f1": summary.get("average_pitch_f1"),
+                "average_rhythm_f1": summary.get("average_rhythm_f1"),
+                "pitch_precision": summary.get("average_pitch_precision"),
+                "pitch_recall": summary.get("average_pitch_recall"),
+                "rhythm_precision": summary.get("average_rhythm_precision"),
+                "rhythm_recall": summary.get("average_rhythm_recall"),
+                "report_path": iter_report_path.as_posix() if iter_report_path else None,
+                "exit_code": suite_result.exit_code,
+            }
+        )
+
+        pitch_ok = float(summary.get("average_pitch_f1", 0.0)) >= target_accuracy
+        rhythm_ok = float(summary.get("average_rhythm_f1", 0.0)) >= target_accuracy
+        if pitch_ok and rhythm_ok:
+            reached_target = True
+            print("Target accuracy reached; stopping agent loop.")
+            break
+
+    history_path = output_dir / "agent_history.json"
+    history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    print(f"Agent history saved to: {history_path}")
+
+    if not reached_target:
+        print(
+            "Agent mode exhausted the configured strategies without hitting the target accuracy. "
+            "Consider adding more tempos or enabling CREPE."
+        )
+
+    return 0 if reached_target else 1
+
+
 def get_default_suite() -> List[BenchmarkCase]:
     audio_dir = REPO_ROOT / "benchmarks" / "audio"
     ref_dir = REPO_ROOT / "benchmarks" / "reference"
@@ -506,15 +686,57 @@ def main() -> None:
         default=None,
         help="Comma-separated beat times in seconds to override the beat grid (e.g., '0,0.5,1.0,1.5')",
     )
+    parser.add_argument("--agent-mode", action="store_true", help="Iterate through strategies from simple to complex until the target accuracy is reached")
+    parser.add_argument(
+        "--agent-target",
+        type=float,
+        default=0.85,
+        help="Target average pitch/rhythm F1 to stop when running with --agent-mode",
+    )
+    parser.add_argument(
+        "--agent-max-runs",
+        type=int,
+        default=5,
+        help="Maximum number of strategy iterations to attempt in --agent-mode",
+    )
+    parser.add_argument(
+        "--agent-tempos",
+        type=str,
+        default=None,
+        help="Comma-separated tempos to try in --agent-mode (include 'auto' to keep beat tracking)",
+    )
+    parser.add_argument(
+        "--agent-prioritize-crepe",
+        action="store_true",
+        help="When set, try CREPE-powered strategies before the baseline in --agent-mode",
+    )
     args = parser.parse_args()
 
     beat_times_override = None
     if args.beat_times:
         beat_times_override = [float(v) for v in args.beat_times.split(",") if v.strip()]
 
+    if args.agent_mode and not args.suite:
+        raise SystemExit("--agent-mode requires --suite so it can iterate across the benchmark scenarios.")
+
     if args.suite:
         cases = get_default_suite()
-        exit_code = run_suite(
+        if args.agent_mode:
+            agent_tempos = _parse_tempos(args.agent_tempos)
+            exit_code = run_agent_mode(
+                cases,
+                output_dir=args.output_dir,
+                target_accuracy=args.agent_target,
+                max_runs=args.agent_max_runs,
+                tempos=agent_tempos,
+                base_use_crepe=args.use_crepe,
+                prioritize_crepe=args.agent_prioritize_crepe,
+                report_path=args.report,
+                beat_times_override=beat_times_override,
+            )
+            raise SystemExit(exit_code)
+
+        suite_result = run_suite(
             cases,
             use_crepe=args.use_crepe,
             output_dir=args.output_dir,
@@ -523,7 +745,7 @@ def main() -> None:
             tempo_override=args.tempo_bpm,
             beat_times_override=beat_times_override,
         )
-        raise SystemExit(exit_code)
+        raise SystemExit(suite_result.exit_code)
 
     if not args.audio_path or not args.reference_path:
         raise SystemExit("Provide audio_path and reference_path or use --suite for batch mode.")

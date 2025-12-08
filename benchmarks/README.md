@@ -49,6 +49,13 @@ Add new scenarios by creating additional numbered folders that follow the same p
    - `--threshold` fails the command if average pitch or rhythm accuracy falls below the given fraction (default 0.75), which is useful for CI.
    - `--output-dir` collects per-clip `*_pred.musicxml`, `*_pred.mid`, and `*_summary.json` artifacts.
    - `--report` writes a Markdown rollup to `benchmarks/results_accuracy.md`.
+5. **Agent mode (iterative strategies from simple → real-world):**
+   ```bash
+   python benchmarks/benchmark_local_file.py --suite --agent-mode --agent-target 0.9 \
+     --agent-max-runs 6 --agent-tempos auto,92,100,110 --agent-prioritize-crepe
+   ```
+   - Starts with the simplest fixtures and tries multiple strategies (tempo overrides and pitch trackers) until both average pitch and rhythm F1 clear the target.
+   - Writes per-iteration reports (if `--report` is supplied) plus `benchmarks_results/agent_history.json` so you can trace accuracy gains.
 
 ### Interpreting results
 - **Pitch precision/recall/F1:** matches on MIDI pitch and onset within ±0.25 beat; false positives reduce precision and F1.
