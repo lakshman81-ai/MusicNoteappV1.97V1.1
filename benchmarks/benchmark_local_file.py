@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +9,13 @@ from typing import Dict, Iterable, List, Tuple
 import sys
 
 import librosa
-from music21 import converter, note as m21note
+import pretty_midi
+import soundfile as sf
+from music21 import converter, midi as m21midi
+
+from backend.metrics import compute_metrics
+from backend.pipeline.models import NoteEvent
+from utils.audio_noise import add_noise_snr
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -17,16 +24,6 @@ if str(REPO_ROOT) not in sys.path:
 from backend.transcription import transcribe_audio_pipeline
 
 NoteTuple = Tuple[int, float, float]  # (midi, onset_beats, duration_beats)
-
-
-@dataclass
-class MatchStats:
-    accuracy: float
-    matched: int
-    missed: int
-    extra: int
-    missed_onsets_sample: List[float]
-    extra_onsets_sample: List[float]
 
 
 @dataclass
@@ -46,14 +43,59 @@ class BenchmarkCase:
         ).strip("_")
 
 
-@dataclass
-class MatchMetrics:
-    precision: float
-    recall: float
-    f1: float
-    matched: int
-    reference_total: int
-    predicted_total: int
+def _midi_note_to_hz(midi_note: int) -> float:
+    return float(librosa.midi_to_hz(midi_note)) if midi_note > 0 else 0.0
+
+
+def _note_from_pretty_midi(note: pretty_midi.Note) -> NoteEvent:
+    return NoteEvent(
+        start_sec=float(note.start),
+        end_sec=float(note.end),
+        midi_note=int(note.pitch),
+        pitch_hz=_midi_note_to_hz(int(note.pitch)),
+    )
+
+
+def load_reference_notes(path: Path) -> List[NoteEvent]:
+    """Load reference notes from MIDI or MusicXML into NoteEvent structures."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Reference file not found: {path}")
+
+    if path.suffix.lower() in {".mid", ".midi"}:
+        midi_data = pretty_midi.PrettyMIDI(str(path))
+    else:
+        score = converter.parse(str(path))
+        midi_bytes = m21midi.translate.streamToMidiFile(score).writestr()
+        midi_data = pretty_midi.PrettyMIDI(io.BytesIO(midi_bytes))
+
+    notes: List[NoteEvent] = []
+    for instrument in midi_data.instruments:
+        for note in instrument.notes:
+            notes.append(_note_from_pretty_midi(note))
+
+    notes.sort(key=lambda n: n.start_sec)
+    return notes
+
+
+def load_predicted_notes(predicted: Iterable[NoteEvent]) -> List[NoteEvent]:
+    return sorted(list(predicted), key=lambda n: n.start_sec)
+
+
+def ensure_noisy_audio(source: Path, snr_db: float, target_root: Path) -> Path:
+    """Create (or load) a noisy copy of the source audio at the requested SNR."""
+
+    target_dir = target_root / f"SNR{int(snr_db)}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / f"{source.stem}_SNR{int(snr_db)}.wav"
+    if target_path.exists():
+        return target_path
+
+    audio, sr = librosa.load(str(source), sr=None, mono=False)
+    seed = abs(hash((source.as_posix(), snr_db))) % (2**32)
+    noisy = add_noise_snr(audio, snr_db, seed=seed)
+    sf.write(target_path, noisy.T if noisy.ndim > 1 else noisy, sr)
+    return target_path
 
 
 @dataclass
@@ -96,57 +138,6 @@ def extract_notes(score_path: Path) -> List[NoteTuple]:
     return notes
 
 
-def match_accuracy(
-    reference: List[NoteTuple],
-    predicted: List[NoteTuple],
-    tol_beats: float = 0.25,
-    require_duration: bool = False,
-    sample_limit: int = 5,
-) -> MatchStats:
-    if not reference:
-        extra_onsets = [p_onset for _, p_onset, _ in predicted][:sample_limit]
-        return MatchStats(
-            accuracy=0.0,
-            matched=0,
-            missed=0,
-            extra=len(predicted),
-            missed_onsets_sample=[],
-            extra_onsets_sample=extra_onsets,
-        )
-
-    matched = 0
-    used_pred: set[int] = set()
-    missed_onsets: List[float] = []
-
-    for midi, onset, duration in reference:
-        for idx, (p_midi, p_onset, p_duration) in enumerate(predicted):
-            if idx in used_pred:
-                continue
-            if midi != p_midi:
-                continue
-            if abs(onset - p_onset) > tol_beats:
-                continue
-            if require_duration and abs(duration - p_duration) > tol_beats:
-                continue
-            matched += 1
-            used_pred.add(idx)
-            break
-        else:
-            if len(missed_onsets) < sample_limit:
-                missed_onsets.append(onset)
-
-    extra_onsets = [p_onset for idx, (_, p_onset, _) in enumerate(predicted) if idx not in used_pred]
-
-    return MatchStats(
-        accuracy=matched / len(reference),
-        matched=matched,
-        missed=len(reference) - matched,
-        extra=len(extra_onsets),
-        missed_onsets_sample=missed_onsets,
-        extra_onsets_sample=extra_onsets[:sample_limit],
-    )
-
-
 def get_audio_metadata(path: Path) -> tuple[float, int, int]:
     """Return (duration_seconds, sample_rate, channel_count) for an audio file."""
 
@@ -170,24 +161,6 @@ def format_audio_note(sample_rate: int, channels: int, duration_seconds: float) 
     return f"{sr_khz:.1f}kHz {channel_label}, {duration_label}"
 
 
-def calculate_prf(stats: MatchStats) -> MatchMetrics:
-    predicted_total = stats.matched + stats.extra
-    reference_total = stats.matched + stats.missed
-
-    precision = stats.matched / predicted_total if predicted_total else 0.0
-    recall = stats.matched / reference_total if reference_total else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-
-    return MatchMetrics(
-        precision=precision,
-        recall=recall,
-        f1=f1,
-        matched=stats.matched,
-        reference_total=reference_total,
-        predicted_total=predicted_total,
-    )
-
-
 def run_single_case(
     case: BenchmarkCase,
     *,
@@ -199,11 +172,13 @@ def run_single_case(
     """Run transcription for a single audio/reference pair."""
 
     output_dir = output_dir or Path("benchmarks_results")
-    output_dir.mkdir(exist_ok=True)
     if not case.audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {case.audio_path}")
     if not case.reference_path.exists():
         raise FileNotFoundError(f"Reference file not found: {case.reference_path}")
+
+    case_dir = output_dir / case.scenario
+    case_dir.mkdir(parents=True, exist_ok=True)
 
     duration_seconds, sample_rate, channels = get_audio_metadata(case.audio_path)
 
@@ -219,19 +194,18 @@ def run_single_case(
     musicxml_text = result["musicxml"]
     midi_bytes: bytes = result["midi_bytes"]
 
-    pred_xml_path = output_dir / f"{case.slug}_pred.musicxml"
-    pred_mid_path = output_dir / f"{case.slug}_pred.mid"
+    pred_xml_path = case_dir / f"{case.slug}_pred.musicxml"
+    pred_mid_path = case_dir / f"{case.slug}_pred.mid"
 
     pred_xml_path.write_text(musicxml_text, encoding="utf-8")
     pred_mid_path.write_bytes(midi_bytes)
 
-    ref_notes = extract_notes(case.reference_path)
-    pred_notes = extract_notes(pred_xml_path)
+    ref_notes = load_reference_notes(case.reference_path)
+    pred_notes = load_predicted_notes(result.get("notes", []))
 
-    pitch_stats = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=False)
-    rhythm_stats = match_accuracy(ref_notes, pred_notes, tol_beats=0.25, require_duration=True)
-    pitch_metrics = calculate_prf(pitch_stats)
-    rhythm_metrics = calculate_prf(rhythm_stats)
+    metrics = compute_metrics(ref_notes, pred_notes)
+    metrics_path = case_dir / f"{case.audio_path.stem}.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
 
     summary: Dict[str, float | int | str] = {
         "name": case.name,
@@ -244,47 +218,21 @@ def run_single_case(
         "audio_note": format_audio_note(sample_rate, channels, duration_seconds),
         "reference_notes": len(ref_notes),
         "predicted_notes": len(pred_notes),
-        "pitch_accuracy": pitch_stats.accuracy,
-        "pitch_precision": pitch_metrics.precision,
-        "pitch_recall": pitch_metrics.recall,
-        "pitch_f1": pitch_metrics.f1,
-        "pitch_matched": pitch_stats.matched,
-        "pitch_missed": pitch_stats.missed,
-        "pitch_extra": pitch_stats.extra,
-        "pitch_missed_onsets_sample": pitch_stats.missed_onsets_sample,
-        "pitch_extra_onsets_sample": pitch_stats.extra_onsets_sample,
-        "rhythm_accuracy": rhythm_stats.accuracy,
-        "rhythm_precision": rhythm_metrics.precision,
-        "rhythm_recall": rhythm_metrics.recall,
-        "rhythm_f1": rhythm_metrics.f1,
-        "rhythm_matched": rhythm_stats.matched,
-        "rhythm_missed": rhythm_stats.missed,
-        "rhythm_extra": rhythm_stats.extra,
-        "rhythm_missed_onsets_sample": rhythm_stats.missed_onsets_sample,
-        "rhythm_extra_onsets_sample": rhythm_stats.extra_onsets_sample,
         "predicted_musicxml": str(pred_xml_path),
         "predicted_midi": str(pred_mid_path),
+        "metrics_path": str(metrics_path),
+        **metrics,
     }
-
-    summary_path = output_dir / f"{case.slug}_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     print("=== BENCHMARK RESULT ===")
     print(f"Reference notes: {len(ref_notes)}")
     print(f"Predicted notes: {len(pred_notes)}")
-    print(
-        "Pitch accuracy:  "
-        f"{pitch_stats.accuracy * 100:.1f}% | matched {pitch_stats.matched}, "
-        f"missed {pitch_stats.missed}, extra {pitch_stats.extra}"
-    )
-    print(
-        "Rhythm accuracy: "
-        f"{rhythm_stats.accuracy * 100:.1f}% (±0.25 beats) | "
-        f"matched {rhythm_stats.matched}, missed {rhythm_stats.missed}, extra {rhythm_stats.extra}"
-    )
+    print("Metric snapshot:")
+    for key in sorted(metrics.keys()):
+        print(f"  {key}: {metrics[key]:.4f}")
     print(f"Predicted MusicXML saved to: {pred_xml_path}")
     print(f"Predicted MIDI saved to: {pred_mid_path}")
-    print(f"Per-clip summary saved to: {summary_path}")
+    print(f"Metrics saved to: {metrics_path}")
 
     return summary
 
@@ -317,171 +265,80 @@ def run_suite(
         for case in cases
     ]
 
-    def _avg(key: str) -> float:
-        return sum(float(item[key]) for item in summaries) / float(len(summaries))
+    if not summaries:
+        raise ValueError("No benchmark cases provided to run_suite")
 
-    avg_pitch_f1 = _avg("pitch_f1")
-    avg_rhythm_f1 = _avg("rhythm_f1")
+    metric_keys = [k for k in summaries[0].keys() if k.isupper() or "F" in k or "Precision" in k or "Recall" in k]
 
-    suite_summary = {
-        "average_pitch_accuracy": avg_pitch_f1,
-        "average_rhythm_accuracy": avg_rhythm_f1,
-        "average_pitch_precision": _avg("pitch_precision"),
-        "average_pitch_recall": _avg("pitch_recall"),
-        "average_pitch_f1": avg_pitch_f1,
-        "average_rhythm_precision": _avg("rhythm_precision"),
-        "average_rhythm_recall": _avg("rhythm_recall"),
-        "average_rhythm_f1": avg_rhythm_f1,
-        "threshold": threshold,
-        "cases": summaries,
-        "strategy_label": strategy_label or "default",
-    }
+    def _avg(key: str, items: List[Dict[str, float | int | str]]) -> float:
+        return sum(float(item.get(key, 0.0)) for item in items) / float(len(items))
 
-    aggregate_path = output_dir / "accuracy_suite_summary.json"
-    aggregate_path.write_text(json.dumps(suite_summary, indent=2), encoding="utf-8")
+    suite_summary: Dict[str, Dict[str, object]] = {}
+    for scenario in {s["scenario"] for s in summaries}:
+        scenario_cases = [s for s in summaries if s["scenario"] == scenario]
+        metrics_avg = {key: _avg(key, scenario_cases) for key in metric_keys}
+        scenario_summary = {
+            "benchmark": scenario,
+            "case_count": len(scenario_cases),
+            "metrics": metrics_avg,
+            "threshold": threshold,
+            "strategy_label": strategy_label or "default",
+            "cases": scenario_cases,
+        }
+        scenario_dir = output_dir / scenario
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = scenario_dir / "suite_summary.json"
+        summary_path.write_text(json.dumps(scenario_summary, indent=2, sort_keys=True), encoding="utf-8")
+        suite_summary[scenario] = scenario_summary
+        print(f"Scenario {scenario} summary saved to: {summary_path}")
 
-    print("\n=== SUITE SUMMARY ===")
-    print(
-        "Avg pitch precision/recall/F1: "
-        f"{suite_summary['average_pitch_precision']*100:.1f}% / "
-        f"{suite_summary['average_pitch_recall']*100:.1f}% / "
-        f"{avg_pitch_f1*100:.1f}%"
-    )
-    print(
-        "Avg rhythm precision/recall/F1: "
-        f"{suite_summary['average_rhythm_precision']*100:.1f}% / "
-        f"{suite_summary['average_rhythm_recall']*100:.1f}% / "
-        f"{avg_rhythm_f1*100:.1f}% (±0.25 beats)"
-    )
-    print(f"Aggregate summary saved to: {aggregate_path}")
+    all_hm = [_avg("HM", s["cases"]) for s in suite_summary.values() if "HM" in metric_keys]
+    overall_hm = sum(all_hm) / len(all_hm)
+    exit_code = 0 if overall_hm >= threshold else 1
+    if exit_code:
+        print(
+            f"Overall harmonic mean {overall_hm:.3f} below threshold {threshold:.3f}; failing with non-zero exit code."
+        )
 
     if report_path:
         write_markdown_report(suite_summary, report_path)
         print(f"Markdown report saved to: {report_path}")
 
-    exit_code = 0
-    if avg_pitch_f1 < threshold or avg_rhythm_f1 < threshold:
-        print(
-            f"Suite accuracy below threshold ({threshold*100:.0f}%). "
-            "Failing with non-zero exit code."
-        )
-        exit_code = 1
-
     return SuiteRunResult(exit_code=exit_code, summary=suite_summary, strategy_label=strategy_label)
 
 
 def write_markdown_report(suite_summary: Dict[str, object], report_path: Path) -> None:
-    def _prf_from_counts(matched: int, missed: int, extra: int) -> tuple[float, float, float]:
-        precision_den = matched + extra
-        recall_den = matched + missed
-
-        precision = matched / precision_den if precision_den else 0.0
-        recall = matched / recall_den if recall_den else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-
-        return precision * 100, recall * 100, f1 * 100
-
     header = [
-        "# Benchmark accuracy snapshot",
+        "# Benchmark metric snapshot",
         "",
-        "Aggregated pitch and rhythm accuracy measured with `benchmarks/benchmark_local_file.py --suite`.",
+        "Aggregated metrics from `benchmarks/benchmark_local_file.py --suite`.",
         "",
-        "| Scenario | Audio | Reference | Pitch P / R / F1 | Rhythm P / R / F1 (±0.25 beat) | Notes |",
-        "|----------|-------|-----------|------------------|---------------------------------|-------|",
+        "| Scenario | HM | RPA | CA | OA | GEA | OnsetF | OffsetF | OnsetOffsetF |",
+        "|----------|----|-----|----|----|-----|--------|---------|-------------|",
     ]
 
-    rows = []
-    threshold = float(suite_summary.get("threshold", 0.75))
-    for case in suite_summary.get("cases", []):
-        pitch_missed = case.get("pitch_missed", 0)
-        pitch_extra = case.get("pitch_extra", 0)
-        rhythm_missed = case.get("rhythm_missed", 0)
-        rhythm_extra = case.get("rhythm_extra", 0)
-
-        pitch_prf = (
-            float(case.get("pitch_precision", 0.0)) * 100,
-            float(case.get("pitch_recall", 0.0)) * 100,
-            float(case.get("pitch_f1", 0.0)) * 100,
-        )
-        rhythm_prf = (
-            float(case.get("rhythm_precision", 0.0)) * 100,
-            float(case.get("rhythm_recall", 0.0)) * 100,
-            float(case.get("rhythm_f1", 0.0)) * 100,
-        )
-
-        pitch_samples = []
-        if case.get("pitch_missed_onsets_sample"):
-            pitch_samples.append(
-                "missed onsets: " + ", ".join(f"{v:.2f}" for v in case["pitch_missed_onsets_sample"])
-            )
-        if case.get("pitch_extra_onsets_sample"):
-            pitch_samples.append(
-                "extra onsets: " + ", ".join(f"{v:.2f}" for v in case["pitch_extra_onsets_sample"])
-            )
-
-        rhythm_samples = []
-        if case.get("rhythm_missed_onsets_sample"):
-            rhythm_samples.append(
-                "missed onsets: " + ", ".join(f"{v:.2f}" for v in case["rhythm_missed_onsets_sample"])
-            )
-        if case.get("rhythm_extra_onsets_sample"):
-            rhythm_samples.append(
-                "extra onsets: " + ", ".join(f"{v:.2f}" for v in case["rhythm_extra_onsets_sample"])
-            )
-
-        pitch_note = f"Pitch matched {case.get('pitch_matched', 0)} (missed {pitch_missed}, extra {pitch_extra})"
-        rhythm_note = f"Rhythm matched {case.get('rhythm_matched', 0)} (missed {rhythm_missed}, extra {rhythm_extra})"
-
-        samples_note = []
-        if pitch_samples:
-            samples_note.append("Pitch " + "; ".join(pitch_samples))
-        if rhythm_samples:
-            samples_note.append("Rhythm " + "; ".join(rhythm_samples))
-
-        notes_parts = [
-            str(case.get("audio_note", "")),
-            f"{case['predicted_notes']} predicted vs {case['reference_notes']} reference notes.",
-            pitch_note + ".",
-            rhythm_note + ".",
-            " ".join(samples_note),
-            f"Files: `{Path(case['predicted_musicxml']).name}` / `{Path(case['predicted_midi']).name}`.",
-        ]
-
-        notes = " ".join(part for part in notes_parts if part).strip()
+    rows: List[str] = []
+    for scenario, summary in suite_summary.items():
+        metrics = summary.get("metrics", {}) if isinstance(summary, dict) else {}
         rows.append(
             "| "
             + " | ".join(
                 [
-                    str(case["scenario"]),
-                    Path(str(case["audio"])).name,
-                    Path(str(case["reference"])).as_posix(),
-                    f"{pitch_prf[0]:.1f}% / {pitch_prf[1]:.1f}% / {pitch_prf[2]:.1f}%",
-                    f"{rhythm_prf[0]:.1f}% / {rhythm_prf[1]:.1f}% / {rhythm_prf[2]:.1f}%",
-                    notes,
+                    scenario,
+                    f"{metrics.get('HM', 0):.3f}",
+                    f"{metrics.get('RPA', 0):.3f}",
+                    f"{metrics.get('CA', 0):.3f}",
+                    f"{metrics.get('OA', 0):.3f}",
+                    f"{metrics.get('GEA', 0):.3f}",
+                    f"{metrics.get('OnsetF', 0):.3f}",
+                    f"{metrics.get('OffsetF', 0):.3f}",
+                    f"{metrics.get('OnsetOffsetF', 0):.3f}",
                 ]
             )
             + " |"
         )
 
-    footer = [
-        "",
-        "## Averages",
-        (
-            "- Pitch: "
-            f"precision {float(suite_summary['average_pitch_precision'])*100:.1f}%, "
-            f"recall {float(suite_summary['average_pitch_recall'])*100:.1f}%, "
-            f"F1 {float(suite_summary['average_pitch_f1'])*100:.1f}%"
-        ),
-        (
-            "- Rhythm: "
-            f"precision {float(suite_summary['average_rhythm_precision'])*100:.1f}%, "
-            f"recall {float(suite_summary['average_rhythm_recall'])*100:.1f}%, "
-            f"F1 {float(suite_summary['average_rhythm_f1'])*100:.1f}%"
-        ),
-        f"- Threshold: {float(suite_summary['threshold'])*100:.0f}%",
-    ]
-
-    report_path.write_text("\n".join(header + rows + footer) + "\n", encoding="utf-8")
+    report_path.write_text("\n".join(header + rows) + "\n", encoding="utf-8")
 
 
 def _parse_tempos(raw: str | None) -> List[float | None]:
@@ -596,24 +453,22 @@ def run_agent_mode(
         )
 
         summary = suite_result.summary
+        scenario_metrics = [s.get("metrics", {}) for s in summary.values()]
+        average_hm = sum(m.get("HM", 0.0) for m in scenario_metrics) / max(len(scenario_metrics), 1)
+        average_onset_f = sum(m.get("OnsetF", 0.0) for m in scenario_metrics) / max(len(scenario_metrics), 1)
         history.append(
             {
                 "iteration": idx,
                 "strategy": strategy.describe(),
-                "average_pitch_f1": summary.get("average_pitch_f1"),
-                "average_rhythm_f1": summary.get("average_rhythm_f1"),
-                "pitch_precision": summary.get("average_pitch_precision"),
-                "pitch_recall": summary.get("average_pitch_recall"),
-                "rhythm_precision": summary.get("average_rhythm_precision"),
-                "rhythm_recall": summary.get("average_rhythm_recall"),
+                "average_hm": average_hm,
+                "average_onset_f": average_onset_f,
                 "report_path": iter_report_path.as_posix() if iter_report_path else None,
                 "exit_code": suite_result.exit_code,
             }
         )
 
-        pitch_ok = float(summary.get("average_pitch_f1", 0.0)) >= target_accuracy
-        rhythm_ok = float(summary.get("average_rhythm_f1", 0.0)) >= target_accuracy
-        if pitch_ok and rhythm_ok:
+        hm_ok = average_hm >= target_accuracy
+        if hm_ok:
             reached_target = True
             print("Target accuracy reached; stopping agent loop.")
             break
@@ -666,6 +521,27 @@ def get_default_suite() -> List[BenchmarkCase]:
             scenario="04_pop_loops",
         ),
     ]
+
+
+def get_noise_robustness_cases(
+    base_cases: List[BenchmarkCase], snr_levels: Iterable[int] = (20, 10, 0)
+) -> Dict[str, List[BenchmarkCase]]:
+    noise_root = REPO_ROOT / "benchmarks" / "05_noise_robustness"
+    suites: Dict[str, List[BenchmarkCase]] = {}
+    for snr_db in snr_levels:
+        cases: List[BenchmarkCase] = []
+        for case in base_cases:
+            noisy_audio = ensure_noisy_audio(case.audio_path, float(snr_db), noise_root)
+            cases.append(
+                BenchmarkCase(
+                    name=f"{case.name} (SNR{snr_db})",
+                    audio_path=noisy_audio,
+                    reference_path=case.reference_path,
+                    scenario=f"noise_robustness/SNR{snr_db}",
+                )
+            )
+        suites[f"SNR{snr_db}"] = cases
+    return suites
 
 
 def main() -> None:

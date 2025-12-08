@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from copy import deepcopy
 from pathlib import Path
 from typing import Dict
 
@@ -11,77 +10,93 @@ from backend.config_manager import get_config, update_config
 
 
 class RefinementLoop:
-    """Configuration-driven refinement orchestrator."""
+    """Configuration-driven refinement orchestrator based on metric suites."""
 
     def __init__(self, metrics_dir: str | Path = "benchmarks_results") -> None:
         self.metrics_dir = Path(metrics_dir)
         self.metrics_dir.mkdir(parents=True, exist_ok=True)
-        self.best_metrics_path = self.metrics_dir / "best_metrics.json"
-        self.history_path = self.metrics_dir / "config_history.json"
+        self.history_path = self.metrics_dir / "refinement_history.jsonl"
 
-    def _load_metrics(self, metrics_path: Path) -> Dict[str, float]:
-        if metrics_path.suffix.lower() == ".csv":
-            import csv
-
-            with open(metrics_path, newline="", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader, None)
-                return {row[0]: float(row[1]) for row in reader if len(row) >= 2}
-
+    def _load_metrics(self, metrics_path: Path) -> Dict:
         with open(metrics_path, "r", encoding="utf-8") as f:
-            return {k: float(v) for k, v in json.load(f).items()}
+            return json.load(f)
 
-    def _load_best(self) -> Dict[str, float]:
-        if not self.best_metrics_path.exists():
-            return {}
-        with open(self.best_metrics_path, "r", encoding="utf-8") as f:
-            return {k: float(v) for k, v in json.load(f).items()}
+    def _append_history(self, record: Dict) -> None:
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.history_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
 
-    def _save_best(self, metrics: Dict[str, float]) -> None:
-        with open(self.best_metrics_path, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2, sort_keys=True)
+    def _flatten_metrics(self, metrics: Dict) -> Dict[str, Dict[str, float]]:
+        if "datasets" in metrics:
+            return {k: v for k, v in metrics["datasets"].items() if isinstance(v, dict)}
+        if "metrics" in metrics:
+            return {"primary": metrics["metrics"]}
+        if any(isinstance(v, (int, float)) for v in metrics.values()):
+            return {"primary": metrics}
+        return {}
 
-    def _record_history(self, config: Dict, metrics: Dict[str, float]) -> None:
-        record = {
-            "timestamp": time.time(),
-            "config": config,
-            "metrics": metrics,
-        }
-        history: list = []
-        if self.history_path.exists():
-            with open(self.history_path, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        history.append(record)
-        with open(self.history_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+    def _aggregate_metrics(self, metrics: Iterable[Dict[str, float]]) -> Dict[str, float]:
+        aggregate: Dict[str, float] = {}
+        metrics_list = list(metrics)
+        if not metrics_list:
+            return aggregate
+        keys = {k for m in metrics_list for k in m.keys()}
+        for key in keys:
+            aggregate[key] = sum(float(m.get(key, 0.0)) for m in metrics_list) / len(metrics_list)
+        return aggregate
 
-    def _propose_updates(self, metrics: Dict[str, float]) -> Dict:
+    def _noise_baseline_gap(self, datasets: Dict[str, Dict[str, float]]) -> float:
+        noise = datasets.get("05_noise_robustness")
+        if not isinstance(noise, dict):
+            return 0.0
+        hm_values = {}
+        for level, vals in noise.items():
+            if isinstance(vals, dict) and "HM" in vals:
+                hm_values[level] = float(vals.get("HM", 0.0))
+        if not hm_values:
+            return 0.0
+        baseline = hm_values.get("SNR20") or max(hm_values.values())
+        worst = min(hm_values.values())
+        return baseline - worst
+
+    def _apply_rules(self, metrics: Dict[str, float], datasets: Dict[str, Dict[str, float]]) -> Dict:
         cfg = get_config()
         updates: Dict = {}
 
-        # Target octave stability
-        if metrics.get("OA", 1.0) < 0.9:
-            updates.setdefault("update", {})["fmin"] = max(40, cfg.get("fmin", 65.0) - 5)
-            updates["update"]["fmax"] = max(cfg.get("fmax", 2093.0), 2000)
+        target_hm = float(cfg.get("target_hm", 0.9))
+        target_onset_f = float(cfg.get("target_onset_f", 0.9))
 
-        # Encourage onset clarity
-        if metrics.get("OnsetF", 1.0) < 0.9:
-            updates.setdefault("update", {})["onset_threshold_factor"] = round(
-                min(cfg.get("onset_threshold_factor", 0.25) + 0.05, 0.75), 3
-            )
+        current_weights = cfg.get("ensemble_weights", {})
+        swift_weight = float(current_weights.get("swift", 0.4))
+        yin_weight = float(current_weights.get("yin", 0.2))
 
-        # Strengthen SwiftF0 when harmonic mean lags
-        if metrics.get("HM", 1.0) < 0.9:
-            weights = deepcopy(cfg.get("ensemble_weights", {}))
-            swift_weight = weights.get("swift", 0.4)
-            yin_weight = weights.get("yin", 0.2)
-            weights["swift"] = round(min(swift_weight + 0.05, 0.8), 3)
-            weights["yin"] = round(max(yin_weight - 0.02, 0.05), 3)
-            updates.setdefault("update", {})["ensemble_weights"] = weights
+        hm = float(metrics.get("HM", 0.0))
+        onset_f = float(metrics.get("OnsetF", 0.0))
+        ca = float(metrics.get("CA", 0.0))
+        oa = float(metrics.get("OA", 0.0))
 
-        # Prevent short spurious notes if CA is weak
-        if metrics.get("CA", 1.0) < 0.9:
-            updates.setdefault("update", {})["min_note_frames"] = max(3, cfg.get("min_note_frames", 3) + 1)
+        if hm < target_hm:
+            new_swift = min(swift_weight + 0.05, 1.0)
+            new_yin = max(yin_weight - 0.05, 0.0)
+            updates.setdefault("ensemble_weights", {})["swift"] = round(new_swift, 3)
+            updates.setdefault("ensemble_weights", {})["yin"] = round(new_yin, 3)
+            updates["confidence_floor"] = round(float(cfg.get("confidence_floor", 0.1)) + 0.02, 3)
+            updates["median_window"] = int(cfg.get("median_window", 11)) + 2
+
+        if onset_f < target_onset_f:
+            updates["onset_threshold_factor"] = round(float(cfg.get("onset_threshold_factor", 0.25)) + 0.05, 3)
+            updates["min_note_frames"] = int(cfg.get("min_note_frames", 3)) + 1
+
+        if ca < target_hm or oa < target_hm:
+            updates["min_note_frames"] = int(cfg.get("min_note_frames", 3)) + 1
+            updates["fmax"] = round(float(cfg.get("fmax", 2093.0)) * 0.9, 2)
+            updates["fmin"] = max(float(cfg.get("fmin", 65.0)), 80.0)
+
+        noise_gap = self._noise_baseline_gap(datasets)
+        if noise_gap > 0.05:
+            updates["median_window"] = int(updates.get("median_window", cfg.get("median_window", 11))) + 2
+            updates["confidence_floor"] = round(float(updates.get("confidence_floor", cfg.get("confidence_floor", 0.1))) + 0.02, 3)
+            updates.setdefault("ensemble_weights", {})["swift"] = round(updates.get("ensemble_weights", {}).get("swift", swift_weight) + 0.05, 3)
 
         return updates
 
@@ -90,34 +105,34 @@ class RefinementLoop:
         if not metrics_file.exists():
             raise FileNotFoundError(f"Metrics file not found: {metrics_file}")
 
-        metrics = self._load_metrics(metrics_file)
-        best_metrics = self._load_best()
-        current_config = get_config()
+        raw_metrics = self._load_metrics(metrics_file)
+        datasets = self._flatten_metrics(raw_metrics)
+        aggregate_metrics = self._aggregate_metrics(datasets.values()) if datasets else raw_metrics.get(
+            "metrics", raw_metrics
+        )
 
-        updates = self._propose_updates(metrics)
-        updated_config = update_config(updates.get("update", {})) if updates and not dry_run else current_config
+        updates = self._apply_rules(aggregate_metrics, datasets)
+        config_before = get_config()
+        config_after = config_before if dry_run else update_config(updates)
 
-        hm_current = metrics.get("HM", 0.0)
-        hm_best = best_metrics.get("HM", 0.0)
-        if hm_current >= hm_best and not dry_run:
-            self._save_best(metrics)
-
-        if not dry_run:
-            self._record_history(updated_config, metrics)
-
-        return {
-            "metrics": metrics,
-            "best": best_metrics,
-            "applied_updates": updates.get("update", {}),
-            "config": updated_config,
-            "improved": hm_current >= hm_best,
+        record = {
+            "timestamp": time.time(),
+            "changes": updates,
+            "metrics_before": aggregate_metrics,
+            "metrics_after": aggregate_metrics,
+            "config_after": config_after,
+            "metrics_source": str(metrics_file),
         }
+        if not dry_run:
+            self._append_history(record)
+
+        return record
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the configuration-driven refinement loop")
-    parser.add_argument("--metrics", required=True, help="Path to metrics JSON or CSV file")
-    parser.add_argument("--metrics-dir", default="benchmarks_results", help="Directory to store history and best metrics")
+    parser.add_argument("--metrics", required=True, help="Path to metrics JSON file")
+    parser.add_argument("--metrics-dir", default="benchmarks_results", help="Directory to store history")
     parser.add_argument("--dry-run", action="store_true", help="Show proposed updates without writing config")
     args = parser.parse_args()
 
