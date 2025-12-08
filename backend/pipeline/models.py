@@ -26,10 +26,10 @@ class MetaData:
     """Container for audio and score-wide metadata."""
 
     original_sr: Optional[int] = None
-    target_sr: int = 22050
-    sample_rate: int = 22050
+    target_sr: int = 44100
+    sample_rate: int = 44100
     duration_sec: float = 0.0
-    hop_length: int = 256
+    hop_length: int = 512
     time_signature: str = "4/4"
     tempo_bpm: Optional[float] = None
     tempo_override: Optional[float] = None
@@ -90,6 +90,10 @@ class NoteEvent:
     dynamic: str = "mf"
     voice: Optional[str] = None
     articulation: Optional[str] = None
+
+    # Quantization grid (ticks)
+    start_tick: Optional[int] = None
+    duration_ticks: Optional[int] = None
 
     # Musical grid (filled after quantization)
     measure: Optional[int] = None

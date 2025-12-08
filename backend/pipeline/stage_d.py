@@ -11,6 +11,10 @@ from music21.musicxml.m21ToXml import GeneralObjectExporter
 
 from .models import NoteEvent, AnalysisData, VexflowLayout, MetaData
 
+PPQ = 120
+BAR_TICKS = 480
+MIN_STACCATO_TICKS = 30
+
 
 SIXTEENTHS_PER_BEAT = 4.0
 CANDIDATE_GRIDS = [4, 3, 5, 7]
@@ -255,21 +259,44 @@ def quantize_and_render(
     """Quantize NoteEvents and render them to a MusicXML string."""
 
     meta = analysis_data.meta
-    tempo_bpm, beat_times = _estimate_tempo_and_beats(
-        meta, tempo_override=tempo_override, beat_times_override=beat_times_override
-    )
+    tempo_bpm = float(tempo_override or meta.tempo_bpm or 120.0)
     meta.tempo_bpm = tempo_bpm
     time_signature = meta.time_signature or "4/4"
 
-    if not beat_times:
-        beat_duration = 60.0 / tempo_bpm
-        max_event_end = max((e.end_sec for e in events), default=meta.duration_sec or 0.0)
-        total_beats = max(1, int(math.ceil((max_event_end + beat_duration) / beat_duration)))
-        beat_times = [i * beat_duration for i in range(total_beats + 1)]
+    # If Stage C already stamped ticks, trust them; otherwise quantize here.
+    if any(event.start_tick is None or event.duration_ticks is None for event in events):
+        tempo_bpm, beat_times = _estimate_tempo_and_beats(
+            meta, tempo_override=tempo_override, beat_times_override=beat_times_override
+        )
+        meta.tempo_bpm = tempo_bpm
 
-    _quantize_events(
-        events, tempo_bpm=tempo_bpm, time_signature=time_signature, beat_times=beat_times, meta=meta
-    )
+        if not beat_times:
+            beat_duration = 60.0 / tempo_bpm
+            max_event_end = max((e.end_sec for e in events), default=meta.duration_sec or 0.0)
+            total_beats = max(1, int(math.ceil((max_event_end + beat_duration) / beat_duration)))
+            beat_times = [i * beat_duration for i in range(total_beats + 1)]
+
+        _quantize_events(
+            events, tempo_bpm=tempo_bpm, time_signature=time_signature, beat_times=beat_times, meta=meta
+        )
+
+    # Validation and staccato tagging on the tick grid
+    for event in events:
+        if event.midi_note < 24:
+            event.midi_note = 24
+        if event.midi_note > 108:
+            event.midi_note = 108
+        if event.duration_ticks is not None and event.duration_ticks < MIN_STACCATO_TICKS:
+            event.articulation = event.articulation or "staccato"
+
+        if event.duration_ticks is not None:
+            event.duration_beats = float(event.duration_ticks / PPQ)
+        if event.start_tick is not None:
+            measure_idx = event.start_tick // BAR_TICKS
+            beat_within = (event.start_tick % BAR_TICKS) / float(PPQ)
+            event.measure = int(measure_idx + 1)
+            event.beat = float(beat_within + 1.0)
+
     analysis_data.events = events
 
     score = _build_score(events, tempo_bpm=tempo_bpm, time_signature=time_signature, detected_key=meta.detected_key)
