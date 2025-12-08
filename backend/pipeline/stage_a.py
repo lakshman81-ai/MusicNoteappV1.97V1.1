@@ -11,9 +11,13 @@ import soundfile as sf
 from .models import MetaData
 
 
-DEFAULT_TARGET_SR = 22050
-DEFAULT_HOP_LENGTH = 256
+# Stage A constants aligned to the deterministic specification
+DEFAULT_TARGET_SR = 44100
+FALLBACK_SR = 22050
+DEFAULT_HOP_LENGTH = 512
 TARGET_LUFS = -14.0
+SILENCE_THRESHOLD_DBFS = 40.0
+MIN_DURATION_SEC = 0.12
 
 
 def _load_audio(audio_path: str) -> Tuple[np.ndarray, int]:
@@ -54,7 +58,7 @@ def _normalize_channel_orientation(y: np.ndarray) -> tuple[np.ndarray, str, bool
     return y.astype(np.float32), "samples_first", False
 
 
-def _trim_silence(y: np.ndarray, top_db: float = 40.0) -> np.ndarray:
+def _trim_silence(y: np.ndarray, top_db: float = SILENCE_THRESHOLD_DBFS) -> np.ndarray:
     """Trim leading and trailing silence using an energy threshold."""
 
     try:
@@ -69,28 +73,36 @@ def _trim_silence(y: np.ndarray, top_db: float = 40.0) -> np.ndarray:
     return y[start:end].astype(np.float32)
 
 
-def _resample(y: np.ndarray, sr: int, target_sr: int) -> Tuple[np.ndarray, int]:
-    """Resample waveform to the target sample rate."""
+def _resample(y: np.ndarray, sr: int, target_sr: int, fallback_sr: int | None = None) -> Tuple[np.ndarray, int]:
+    """Resample waveform to the target sample rate with an optional fallback."""
 
     if sr == target_sr:
         return y.astype(np.float32), sr
-    y_resampled = librosa.resample(y.astype(np.float32), orig_sr=sr, target_sr=target_sr)
-    return y_resampled.astype(np.float32), target_sr
+    try:
+        y_resampled = librosa.resample(y.astype(np.float32), orig_sr=sr, target_sr=target_sr)
+        return y_resampled.astype(np.float32), target_sr
+    except Exception:
+        if fallback_sr and sr != fallback_sr:
+            y_fallback = librosa.resample(y.astype(np.float32), orig_sr=sr, target_sr=fallback_sr)
+            return y_fallback.astype(np.float32), fallback_sr
+        raise
 
 
 def _normalize_loudness(y: np.ndarray, sr: int) -> Tuple[np.ndarray, float | None]:
-    """Normalize loudness to approximately TARGET_LUFS with a peak fallback."""
+    """Normalize loudness to TARGET_LUFS while enforcing peak ∈ [−1, 1]."""
 
     try:
         meter = pyln.Meter(sr)
         loudness = meter.integrated_loudness(y)
         y_norm = pyln.normalize.loudness(y, loudness, TARGET_LUFS)
-        return y_norm.astype(np.float32), float(loudness)
     except Exception:
-        peak = float(np.max(np.abs(y)))
-        if peak > 0:
-            return (y / peak).astype(np.float32), None
-        return y.astype(np.float32), None
+        y_norm = y.astype(np.float32)
+        loudness = None
+
+    peak = float(np.max(np.abs(y_norm)))
+    if peak > 0:
+        y_norm = np.clip(y_norm / peak, -1.0, 1.0)
+    return y_norm.astype(np.float32), None if loudness is None else float(loudness)
 
 
 def _validate_signal(y: np.ndarray, rms_floor_db: float = -50.0, peak_floor: float = 1e-4) -> Tuple[float, float]:
@@ -172,16 +184,16 @@ def load_and_preprocess(
 
     y = y - float(np.mean(y))
 
-    y_trimmed = _trim_silence(y, top_db=40.0)
+    y_trimmed = _trim_silence(y, top_db=SILENCE_THRESHOLD_DBFS)
 
     if y_trimmed.size == 0:
         raise ValueError("Audio contains only silence after trimming")
 
     duration_after_trim = float(len(y_trimmed) / original_sr)
-    if duration_after_trim < 0.5:
-        raise ValueError("Audio duration after trimming is below 0.5 seconds")
+    if duration_after_trim < MIN_DURATION_SEC:
+        raise ValueError("Audio duration after trimming is below minimum duration")
 
-    y_resampled, sr_out = _resample(y_trimmed, original_sr, target_sr)
+    y_resampled, sr_out = _resample(y_trimmed, original_sr, target_sr, fallback_sr=FALLBACK_SR)
 
     try:
         tuning_offset = float(librosa.estimate_tuning(y=y_resampled, sr=sr_out) * 100.0)
