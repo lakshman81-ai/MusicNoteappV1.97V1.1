@@ -9,11 +9,18 @@ import numpy as np
 from music21 import key as m21key, meter, metadata as m21meta, note as m21note, stream, tempo
 from music21.musicxml.m21ToXml import GeneralObjectExporter
 
-from .models import NoteEvent, AnalysisData, VexflowLayout, MetaData
+from backend.config_manager import get_config
+from .models import AnalysisData, MetaData, NoteEvent, VexflowLayout
 
-PPQ = 120
-BAR_TICKS = 480
-MIN_STACCATO_TICKS = 30
+
+def _stage_d_params() -> dict:
+    cfg = get_config()
+    ppq = int(cfg.get("ppq", 120))
+    return {
+        "ppq": ppq,
+        "bar_ticks": int(cfg.get("bar_ticks", 4 * ppq)),
+        "min_staccato_ticks": int(cfg.get("min_staccato_ticks", 30)),
+    }
 
 
 SIXTEENTHS_PER_BEAT = 4.0
@@ -257,7 +264,7 @@ def quantize_and_render(
     beat_times_override: List[float] | None = None,
 ) -> str:
     """Quantize NoteEvents and render them to a MusicXML string."""
-
+    params = _stage_d_params()
     meta = analysis_data.meta
     tempo_bpm = float(tempo_override or meta.tempo_bpm or 120.0)
     meta.tempo_bpm = tempo_bpm
@@ -286,14 +293,14 @@ def quantize_and_render(
             event.midi_note = 24
         if event.midi_note > 108:
             event.midi_note = 108
-        if event.duration_ticks is not None and event.duration_ticks < MIN_STACCATO_TICKS:
+        if event.duration_ticks is not None and event.duration_ticks < params["min_staccato_ticks"]:
             event.articulation = event.articulation or "staccato"
 
         if event.duration_ticks is not None:
-            event.duration_beats = float(event.duration_ticks / PPQ)
+            event.duration_beats = float(event.duration_ticks / params["ppq"])
         if event.start_tick is not None:
-            measure_idx = event.start_tick // BAR_TICKS
-            beat_within = (event.start_tick % BAR_TICKS) / float(PPQ)
+            measure_idx = event.start_tick // params["bar_ticks"]
+            beat_within = (event.start_tick % params["bar_ticks"]) / float(params["ppq"])
             event.measure = int(measure_idx + 1)
             event.beat = float(beat_within + 1.0)
 

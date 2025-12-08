@@ -8,16 +8,20 @@ import numpy as np
 import pyloudnorm as pyln
 import soundfile as sf
 
+from backend.config_manager import get_config
 from .models import MetaData
 
 
-# Stage A constants aligned to the deterministic specification
-DEFAULT_TARGET_SR = 44100
-FALLBACK_SR = 22050
-DEFAULT_HOP_LENGTH = 512
-TARGET_LUFS = -14.0
-SILENCE_THRESHOLD_DBFS = 40.0
-MIN_DURATION_SEC = 0.12
+def _stage_a_params() -> dict:
+    cfg = get_config()
+    return {
+        "target_sr": int(cfg.get("sample_rate", 44100)),
+        "fallback_sr": int(cfg.get("fallback_sample_rate", 22050)),
+        "hop_length": int(cfg.get("hop_length", 512)),
+        "target_lufs": float(cfg.get("target_lufs", -14.0)),
+        "silence_threshold_dbfs": float(cfg.get("silence_threshold_dbfs", 40.0)),
+        "min_duration_sec": float(cfg.get("min_duration_sec", 0.12)),
+    }
 
 
 def _load_audio(audio_path: str) -> Tuple[np.ndarray, int]:
@@ -58,7 +62,7 @@ def _normalize_channel_orientation(y: np.ndarray) -> tuple[np.ndarray, str, bool
     return y.astype(np.float32), "samples_first", False
 
 
-def _trim_silence(y: np.ndarray, top_db: float = SILENCE_THRESHOLD_DBFS) -> np.ndarray:
+def _trim_silence(y: np.ndarray, top_db: float) -> np.ndarray:
     """Trim leading and trailing silence using an energy threshold."""
 
     try:
@@ -88,13 +92,13 @@ def _resample(y: np.ndarray, sr: int, target_sr: int, fallback_sr: int | None = 
         raise
 
 
-def _normalize_loudness(y: np.ndarray, sr: int) -> Tuple[np.ndarray, float | None]:
-    """Normalize loudness to TARGET_LUFS while enforcing peak ∈ [−1, 1]."""
+def _normalize_loudness(y: np.ndarray, sr: int, target_lufs: float) -> Tuple[np.ndarray, float | None]:
+    """Normalize loudness to a target LUFS while enforcing peak ∈ [−1, 1]."""
 
     try:
         meter = pyln.Meter(sr)
         loudness = meter.integrated_loudness(y)
-        y_norm = pyln.normalize.loudness(y, loudness, TARGET_LUFS)
+        y_norm = pyln.normalize.loudness(y, loudness, target_lufs)
     except Exception:
         y_norm = y.astype(np.float32)
         loudness = None
@@ -145,7 +149,7 @@ def _adaptive_window(y: np.ndarray, sr: int) -> int:
 
 def load_and_preprocess(
     audio_path: str,
-    target_sr: int = DEFAULT_TARGET_SR,
+    target_sr: int | None = None,
     stereo_mode: bool = False,
     start_offset: float = 0.0,
     max_duration: float | None = None,
@@ -158,6 +162,8 @@ def load_and_preprocess(
     """
 
     audio_path = str(Path(audio_path))
+    params = _stage_a_params()
+    target_sr = target_sr or params["target_sr"]
     y, original_sr = _load_audio(audio_path)
 
     input_shape = tuple(y.shape)
@@ -184,16 +190,18 @@ def load_and_preprocess(
 
     y = y - float(np.mean(y))
 
-    y_trimmed = _trim_silence(y, top_db=SILENCE_THRESHOLD_DBFS)
+    y_trimmed = _trim_silence(y, top_db=params["silence_threshold_dbfs"])
 
     if y_trimmed.size == 0:
         raise ValueError("Audio contains only silence after trimming")
 
     duration_after_trim = float(len(y_trimmed) / original_sr)
-    if duration_after_trim < MIN_DURATION_SEC:
+    if duration_after_trim < params["min_duration_sec"]:
         raise ValueError("Audio duration after trimming is below minimum duration")
 
-    y_resampled, sr_out = _resample(y_trimmed, original_sr, target_sr, fallback_sr=FALLBACK_SR)
+    y_resampled, sr_out = _resample(
+        y_trimmed, original_sr, target_sr, fallback_sr=params["fallback_sr"]
+    )
 
     try:
         tuning_offset = float(librosa.estimate_tuning(y=y_resampled, sr=sr_out) * 100.0)
@@ -205,7 +213,7 @@ def load_and_preprocess(
         except Exception:
             pass
 
-    y_norm, loudness = _normalize_loudness(y_resampled, sr_out)
+    y_norm, loudness = _normalize_loudness(y_resampled, sr_out, params["target_lufs"])
 
     rms_db, peak_level = _validate_signal(y_norm)
 
@@ -217,7 +225,7 @@ def load_and_preprocess(
         target_sr=sr_out,
         sample_rate=sr_out,
         duration_sec=duration_sec,
-        hop_length=DEFAULT_HOP_LENGTH,
+        hop_length=params["hop_length"],
         time_signature="4/4",
         tempo_bpm=None,
         detected_key=None,

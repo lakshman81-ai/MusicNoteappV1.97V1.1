@@ -6,28 +6,36 @@ from typing import Dict, List, Tuple
 import librosa
 import numpy as np
 
-from .models import FramePitch, MetaData, NoteEvent, ChordEvent
-
-# Stage B constants (deterministic)
-F_MIN = 65.0  # C2
-F_MAX = 2093.0  # C7
-CONF_MIN = 0.10
-FRAME_LENGTH = 2048
-HOP_LENGTH = 512
-MEDIAN_WINDOW = 11
-
-# Detector weights (normalized per frame)
-BASE_WEIGHTS: Dict[str, float] = {
-    "swift": 0.45,
-    "crepe": 0.25,
-    "rmvpe": 0.25,
-    "yin": 0.15,
-    "cqt": 0.10,
-    "autocorr": 0.10,
-}
+from backend.config_manager import get_config
+from .models import ChordEvent, FramePitch, MetaData, NoteEvent
 
 
-def _smooth_series(values: np.ndarray, window: int = MEDIAN_WINDOW) -> np.ndarray:
+def _stage_b_params() -> dict:
+    cfg = get_config()
+    weights = cfg.get("ensemble_weights", {})
+    default_weights: Dict[str, float] = {
+        "swift": 0.45,
+        "crepe": 0.25,
+        "rmvpe": 0.25,
+        "yin": 0.15,
+        "cqt": 0.10,
+        "autocorr": 0.10,
+    }
+    default_weights.update({k.lower(): v for k, v in weights.items()})
+    return {
+        "fmin": float(cfg.get("fmin", 65.0)),
+        "fmax": float(cfg.get("fmax", 2093.0)),
+        "conf_min": float(cfg.get("confidence_floor", 0.10)),
+        "frame_length": int(cfg.get("frame_length", 2048)),
+        "hop_length": int(cfg.get("hop_length", 512)),
+        "median_window": int(cfg.get("median_window", 11)),
+        "weights": default_weights,
+        "onset_threshold_factor": float(cfg.get("onset_threshold_factor", 0.25)),
+        "min_note_frames": int(cfg.get("min_note_frames", 3)),
+    }
+
+
+def _smooth_series(values: np.ndarray, window: int) -> np.ndarray:
     if window % 2 == 0:
         window += 1
     pad = window // 2
@@ -38,25 +46,27 @@ def _smooth_series(values: np.ndarray, window: int = MEDIAN_WINDOW) -> np.ndarra
     return smoothed
 
 
-def _detector_yin(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
-    yin_pitch = librosa.yin(y, fmin=F_MIN, fmax=F_MAX, sr=sr, frame_length=FRAME_LENGTH, hop_length=HOP_LENGTH)
+def _detector_yin(
+    y: np.ndarray, sr: int, fmin: float, fmax: float, frame_length: int, hop_length: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    yin_pitch = librosa.yin(y, fmin=fmin, fmax=fmax, sr=sr, frame_length=frame_length, hop_length=hop_length)
     conf = np.where(np.isfinite(yin_pitch), 0.6, 0.0)
     return yin_pitch.astype(float), conf.astype(float)
 
 
-def _detector_cqt(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
-    n_bins = int(np.ceil(12 * np.log2(F_MAX / F_MIN))) * 3
+def _detector_cqt(y: np.ndarray, sr: int, fmin: float, fmax: float, hop_length: int) -> Tuple[np.ndarray, np.ndarray]:
+    n_bins = int(np.ceil(12 * np.log2(fmax / fmin))) * 3
     cqt = librosa.cqt(
         y,
         sr=sr,
-        hop_length=HOP_LENGTH,
-        fmin=F_MIN,
+        hop_length=hop_length,
+        fmin=fmin,
         n_bins=n_bins,
         bins_per_octave=36,
         pad_mode="reflect",
     )
     mags = np.abs(cqt)
-    freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=F_MIN, bins_per_octave=36)
+    freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin, bins_per_octave=36)
     pitches = np.zeros(mags.shape[1], dtype=float)
     conf = np.zeros_like(pitches)
     for idx in range(mags.shape[1]):
@@ -71,10 +81,10 @@ def _detector_cqt(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
     return pitches, conf
 
 
-def _detector_autocorr(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
-    frames = librosa.util.frame(y, frame_length=FRAME_LENGTH, hop_length=HOP_LENGTH).T
-    min_lag = int(sr / F_MAX)
-    max_lag = int(sr / F_MIN)
+def _detector_autocorr(y: np.ndarray, sr: int, fmin: float, fmax: float, frame_length: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray]:
+    frames = librosa.util.frame(y, frame_length=frame_length, hop_length=hop_length).T
+    min_lag = int(sr / fmax)
+    max_lag = int(sr / fmin)
     pitches = np.full(frames.shape[0], np.nan, dtype=float)
     conf = np.zeros_like(pitches)
     for i, frame in enumerate(frames):
@@ -92,7 +102,7 @@ def _detector_autocorr(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
     return pitches, conf
 
 
-def _detector_swift(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray] | None:
+def _detector_swift(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray] | None:
     if importlib.util.find_spec("swift" ) is None and importlib.util.find_spec("swiftf0") is None:
         return None
     try:
@@ -103,17 +113,17 @@ def _detector_swift(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray] | N
         except Exception:
             return None
     model = swift(sample_rate=sr)
-    result = model.infer(y, hop_size=HOP_LENGTH)
+    result = model.infer(y, hop_size=hop_length)
     pitches = np.asarray(result["f0_hz"], dtype=float)
     conf = np.asarray(result.get("confidence", np.ones_like(pitches)), dtype=float)
     return pitches, conf
 
 
-def _detector_crepe(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray] | None:
+def _detector_crepe(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray] | None:
     if importlib.util.find_spec("crepe") is None:
         return None
     crepe = importlib.import_module("crepe")
-    step_ms = HOP_LENGTH * 1000.0 / sr
+    step_ms = hop_length * 1000.0 / sr
     if sr != 16000:
         y_resampled = librosa.resample(y, orig_sr=sr, target_sr=16000)
         sr_used = 16000
@@ -124,7 +134,11 @@ def _detector_crepe(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray] | N
     return frequency.astype(float), confidence.astype(float)
 
 
-def _aggregate(detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _aggregate(
+    detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    conf_min: float,
+    weights: Dict[str, float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     reference_len = min(len(v[0]) for v in detector_outputs.values()) if detector_outputs else 0
     pitches = np.full(reference_len, np.nan, dtype=float)
     conf = np.zeros(reference_len, dtype=float)
@@ -141,7 +155,7 @@ def _aggregate(detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> Tu
                 continue
             frame_candidates.append(freq)
             frame_conf.append(prob)
-            frame_weights.append(BASE_WEIGHTS.get(name, 0.1))
+            frame_weights.append(weights.get(name, 0.1))
 
         if not frame_candidates:
             continue
@@ -152,7 +166,7 @@ def _aggregate(detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> Tu
             swift_conf = float(detector_outputs["swift"][1][idx]) if idx < len(detector_outputs["swift"][1]) else 0.0
             if np.isfinite(swift_freq) and swift_freq > 0 and swift_conf >= 0.50:
                 pitches[idx] = swift_freq
-                conf[idx] = max(swift_conf, CONF_MIN)
+                conf[idx] = max(swift_conf, conf_min)
                 unstable[idx] = False
                 continue
 
@@ -160,7 +174,7 @@ def _aggregate(detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> Tu
         if len(cents) >= 2 and np.any(np.abs(cents - cents[0]) > 120.0):
             best_idx = int(np.argmax(frame_conf))
             pitches[idx] = frame_candidates[best_idx]
-            conf[idx] = max(frame_conf[best_idx], CONF_MIN)
+            conf[idx] = max(frame_conf[best_idx], conf_min)
             unstable[idx] = True
             continue
 
@@ -171,14 +185,14 @@ def _aggregate(detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> Tu
     return pitches, conf, unstable
 
 
-def _detect_chords_from_chroma(y: np.ndarray, sr: int) -> List[ChordEvent]:
+def _detect_chords_from_chroma(y: np.ndarray, sr: int, hop_length: int) -> List[ChordEvent]:
     chords: List[ChordEvent] = []
     try:
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH)
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
     except Exception:
         return chords
 
-    frames_per_second = max(1, int(round(sr / HOP_LENGTH)))
+    frames_per_second = max(1, int(round(sr / hop_length)))
     major_template = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0], dtype=float)
     minor_template = np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0], dtype=float)
 
@@ -206,7 +220,7 @@ def _detect_chords_from_chroma(y: np.ndarray, sr: int) -> List[ChordEvent]:
                 best_quality = "min"
         if best_root is None or best_quality is None:
             continue
-        time_sec = float(librosa.frames_to_time(start_frame, sr=sr, hop_length=HOP_LENGTH))
+        time_sec = float(librosa.frames_to_time(start_frame, sr=sr, hop_length=hop_length))
         beat_val = float(time_sec * 120.0 / 60.0)
         symbol = f"{best_root}{'' if best_quality == 'maj' else 'm'}"
         chords.append(ChordEvent(time=time_sec, beat=beat_val, symbol=symbol, root=best_root, quality=best_quality))
@@ -228,37 +242,41 @@ def extract_features(
     velocity_seed: int | None = None,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
     """Stage B: ensemble pitch detection with deterministic rules."""
-
-    hop_length = HOP_LENGTH
+    params = _stage_b_params()
+    hop_length = params["hop_length"]
     detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 
-    yin_pitch, yin_conf = _detector_yin(y, sr)
+    yin_pitch, yin_conf = _detector_yin(
+        y, sr, params["fmin"], params["fmax"], params["frame_length"], hop_length
+    )
     detector_outputs["yin"] = (yin_pitch, yin_conf)
 
-    cqt_pitch, cqt_conf = _detector_cqt(y, sr)
+    cqt_pitch, cqt_conf = _detector_cqt(y, sr, params["fmin"], params["fmax"], hop_length)
     detector_outputs["cqt"] = (cqt_pitch, cqt_conf)
 
-    autocorr_pitch, autocorr_conf = _detector_autocorr(y, sr)
+    autocorr_pitch, autocorr_conf = _detector_autocorr(
+        y, sr, params["fmin"], params["fmax"], params["frame_length"], hop_length
+    )
     detector_outputs["autocorr"] = (autocorr_pitch, autocorr_conf)
 
-    swift_output = _detector_swift(y, sr)
+    swift_output = _detector_swift(y, sr, hop_length)
     if swift_output is not None:
         detector_outputs["swift"] = swift_output
 
-    crepe_output = _detector_crepe(y, sr) if use_crepe else None
+    crepe_output = _detector_crepe(y, sr, hop_length) if use_crepe else None
     if crepe_output is not None:
         detector_outputs["crepe"] = crepe_output
 
-    pitches, conf, unstable = _aggregate(detector_outputs)
+    pitches, conf, unstable = _aggregate(detector_outputs, params["conf_min"], params["weights"])
     conf = np.clip(conf, 0.0, 1.0)
-    conf = np.maximum(conf, CONF_MIN)
+    conf = np.maximum(conf, params["conf_min"])
     times = librosa.times_like(pitches, sr=sr, hop_length=hop_length)
 
     # Median smoothing respecting NaNs
     pitch_smooth = pitches.copy()
     for idx in range(len(pitches)):
-        start = max(0, idx - MEDIAN_WINDOW // 2)
-        end = min(len(pitches), idx + MEDIAN_WINDOW // 2 + 1)
+        start = max(0, idx - params["median_window"] // 2)
+        end = min(len(pitches), idx + params["median_window"] // 2 + 1)
         window_vals = pitches[start:end]
         window_vals = window_vals[np.isfinite(window_vals)]
         if window_vals.size:
@@ -278,7 +296,7 @@ def extract_features(
             midi = int(round(midi_val)) if np.isfinite(midi_val) else None
         timeline.append(FramePitch(time=float(t), pitch_hz=float(f) if np.isfinite(f) else 0.0, midi=midi, confidence=float(c)))
         if unstable_flag:
-            timeline[-1].confidence = max(float(c), CONF_MIN)
+            timeline[-1].confidence = max(float(c), params["conf_min"])
 
     # Stage C rules: deterministic segmentation
     frame_duration = float(hop_length / sr)
@@ -287,7 +305,7 @@ def extract_features(
     # Spectral flux for onset/silence gating
     stft = np.abs(librosa.stft(y, n_fft=1024, hop_length=hop_length))
     flux = np.sqrt(np.sum(np.square(np.diff(stft, axis=1).clip(min=0)), axis=0))
-    flux_threshold = 0.25 * np.median(np.abs(flux)) if flux.size else 0.0
+    flux_threshold = params["onset_threshold_factor"] * np.median(np.abs(flux)) if flux.size else 0.0
 
     notes: List[NoteEvent] = []
     current_note: NoteEvent | None = None
@@ -323,7 +341,7 @@ def extract_features(
         silence_run = silence_run + 1 if is_silent_frame else 0
 
         if current_note is None:
-            if stable_run >= 3 and confidence >= CONF_MIN:
+            if stable_run >= params["min_note_frames"] and confidence >= params["conf_min"]:
                 velocity = _map_velocity(rms[idx], rms_floor, rms_ceiling)
                 current_note = NoteEvent(
                     start_sec=frame.time,
@@ -340,7 +358,7 @@ def extract_features(
         # termination conditions
         pitch_jump = cents_diff(pitch, current_note.pitch_hz) if pitch > 0 else 0.0
         end_due_to_jump = pitch > 0 and pitch_jump > 120.0
-        end_due_to_conf = low_conf_run >= 3
+        end_due_to_conf = low_conf_run >= params["min_note_frames"]
         end_due_to_silence = silence_run >= silence_frames_required
 
         if end_due_to_jump or end_due_to_conf or end_due_to_silence:
@@ -364,6 +382,6 @@ def extract_features(
         notes.append(current_note)
 
     meta.pitch_tracker = "ensemble"
-    chords = _detect_chords_from_chroma(y, sr)
+    chords = _detect_chords_from_chroma(y, sr, hop_length)
 
     return timeline, notes, chords
