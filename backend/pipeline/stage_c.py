@@ -2,14 +2,20 @@ from __future__ import annotations
 
 from typing import List
 
-from .models import NoteEvent, AnalysisData
+from backend.config_manager import get_config
+from .models import AnalysisData, NoteEvent
 
 
-# Quantization constants (Stage C)
-PPQ = 120
-BAR_TICKS = 480
-MIN_NOTE_TICKS = 30
-MIN_GRID_MS = 4.0
+def _stage_c_params() -> dict:
+    cfg = get_config()
+    ppq = int(cfg.get("ppq", 120))
+    bar_ticks = int(cfg.get("bar_ticks", 4 * ppq))
+    return {
+        "ppq": ppq,
+        "bar_ticks": bar_ticks,
+        "min_note_ticks": int(cfg.get("min_note_ticks", 30)),
+        "min_grid_ms": float(cfg.get("min_grid_ms", 4.0)),
+    }
 
 
 def apply_theory(
@@ -25,9 +31,11 @@ def apply_theory(
     - Assigns measure/beat using a 480-tick bar (4/4) and writes tick metadata.
     """
 
+    params = _stage_c_params()
+
     tempo_bpm = float(analysis_data.meta.tempo_bpm or 120.0)
-    seconds_per_tick = 60.0 / (tempo_bpm * PPQ)
-    min_grid_ticks = max(1, int(round((MIN_GRID_MS / 1000.0) / seconds_per_tick)))
+    seconds_per_tick = 60.0 / (tempo_bpm * params["ppq"])
+    min_grid_ticks = max(1, int(round((params["min_grid_ms"] / 1000.0) / seconds_per_tick)))
 
     def _snap_to_grid(seconds: float) -> int:
         raw_ticks = seconds / seconds_per_tick
@@ -62,9 +70,9 @@ def apply_theory(
             duration_ticks = end_tick - start_tick
 
         duration_seconds = duration_ticks * seconds_per_tick
-        if duration_ticks < MIN_NOTE_TICKS and duration_seconds < 0.12:
+        if duration_ticks < params["min_note_ticks"] and duration_seconds < 0.12:
             note.is_grace = True
-        note.articulation = "staccato" if duration_ticks < MIN_NOTE_TICKS else note.articulation
+        note.articulation = "staccato" if duration_ticks < params["min_note_ticks"] else note.articulation
 
         note.dynamic = _map_dynamic(getattr(note, "amplitude", 0.0))
         note.midi_note = midi_note
@@ -73,11 +81,11 @@ def apply_theory(
         note.start_sec = start_tick * seconds_per_tick
         note.end_sec = note.start_sec + duration_ticks * seconds_per_tick
 
-        measure_idx = start_tick // BAR_TICKS
-        beat_within = (start_tick % BAR_TICKS) / float(PPQ)
+        measure_idx = start_tick // params["bar_ticks"]
+        beat_within = (start_tick % params["bar_ticks"]) / float(params["ppq"])
         note.measure = int(measure_idx + 1)
         note.beat = float(beat_within + 1.0)
-        note.duration_beats = float(duration_ticks / PPQ)
+        note.duration_beats = float(duration_ticks / params["ppq"])
 
         processed.append(note)
         last_end_per_pitch[midi_note] = end_tick
