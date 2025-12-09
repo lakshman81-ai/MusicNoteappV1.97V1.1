@@ -1,0 +1,15 @@
+{
+  "CA": 0.0,
+  "GEA": 1.0,
+  "HM": 0.0,
+  "OA": 0.0,
+  "OffsetPrecision": 0.0,
+  "OffsetRecall": 0.0,
+  "OnsetF": 0.0,
+  "OnsetOffsetF": 0.0,
+  "OnsetPrecision": 0.0,
+  "OnsetRecall": 0.0,
+  "RPA": 0.0,
+  "VoicingPrecision": 0.0,
+  "VoicingRecall": 0.0
+}

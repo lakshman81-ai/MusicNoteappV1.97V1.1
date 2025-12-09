@@ -4,9 +4,12 @@ import argparse
 import json
 import sys
 import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
+
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -14,8 +17,113 @@ if str(REPO_ROOT) not in sys.path:
 
 from backend.config_manager import get_config, update_config
 from backend.metrics import compute_metrics, save_metrics
+from backend.pipeline.models import NoteEvent
 from backend.transcription import transcribe_audio_pipeline
-from benchmarks.benchmark_local_file import load_predicted_notes, load_reference_notes
+from music21 import converter, tempo
+
+
+def _load_reference_notes(path: Path) -> List[NoteEvent]:
+    """Load reference notes from MusicXML or MIDI using music21 only."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Reference file not found: {path}")
+
+    score = converter.parse(str(path))
+    tempo_boundaries = score.metronomeMarkBoundaries()
+    bpm = None
+    if tempo_boundaries:
+        _, _, mm = tempo_boundaries[0]
+        if isinstance(mm, tempo.MetronomeMark) and mm.number:
+            bpm = float(mm.number)
+    seconds_per_beat = 60.0 / (bpm if bpm else 120.0)
+
+    notes: List[NoteEvent] = []
+    for n in score.recurse().notes:
+        onset_beats = float(n.offset)
+        duration_beats = float(getattr(n, "quarterLength", 0.0))
+        onset = onset_beats * seconds_per_beat
+        offset = onset + duration_beats * seconds_per_beat
+        notes.append(
+            NoteEvent(
+                start_sec=onset,
+                end_sec=offset,
+                midi_note=int(n.pitch.midi),
+                pitch_hz=float(n.pitch.frequency),
+            )
+        )
+
+    notes.sort(key=lambda n: n.start_sec)
+    return notes
+
+
+def _load_predicted_notes(predicted: Iterable[NoteEvent]) -> List[NoteEvent]:
+    return sorted(list(predicted), key=lambda n: n.start_sec)
+
+
+def _note_debug_slice(notes: List[NoteEvent], *, limit: int = 5) -> List[Dict[str, Any]]:
+    return [
+        {
+            "onset_sec": round(n.start_sec, 6),
+            "offset_sec": round(n.end_sec, 6),
+            "midi_pitch": int(n.midi_note),
+            "name": getattr(n, "note_name", None),
+        }
+        for n in notes[:limit]
+    ]
+
+
+def _maybe_generate_audio(
+    audio_path: Path, reference_notes: List[NoteEvent], sample_rate: int
+) -> None:
+    """
+    Create a lightweight synthetic audio file if the expected fixture is missing.
+
+    This keeps the benchmark PR-friendly by avoiding tracked binaries while still
+    enabling local runs. A simple sine-wave synthesizer is used to render the
+    reference melody with gentle fades to avoid clicks.
+    """
+
+    if audio_path.exists():
+        return
+
+    if not reference_notes:
+        raise ValueError("Reference notes are required to synthesize the audio fixture.")
+
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    total_duration = max((n.end_sec for n in reference_notes), default=0.0) + 0.1
+    num_samples = max(1, int(total_duration * sample_rate))
+    buffer = np.zeros(num_samples, dtype=np.float32)
+
+    fade_samples = max(1, int(0.005 * sample_rate))
+    for note in reference_notes:
+        start_idx = max(0, int(note.start_sec * sample_rate))
+        end_idx = max(start_idx + 1, int(note.end_sec * sample_rate))
+        if end_idx > buffer.shape[0]:
+            pad = end_idx - buffer.shape[0]
+            buffer = np.concatenate([buffer, np.zeros(pad, dtype=np.float32)])
+
+        duration = (end_idx - start_idx) / float(sample_rate)
+        freq = float(note.pitch_hz or 440.0 * (2 ** ((note.midi_note - 69) / 12)))
+        t = np.linspace(0, duration, end_idx - start_idx, endpoint=False)
+        tone = 0.3 * np.sin(2 * np.pi * freq * t)
+
+        fade = min(fade_samples, tone.size // 2)
+        if fade > 0:
+            fade_in = np.linspace(0.0, 1.0, fade)
+            fade_out = np.linspace(1.0, 0.0, fade)
+            tone[:fade] *= fade_in
+            tone[-fade:] *= fade_out
+
+        buffer[start_idx:end_idx] += tone.astype(np.float32)
+
+    buffer = np.clip(buffer, -1.0, 1.0)
+    int_samples = np.int16(buffer * 32767)
+
+    with wave.open(str(audio_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(int_samples.tobytes())
 
 
 @dataclass
@@ -135,8 +243,6 @@ def _prepare_paths(round_number: int) -> BenchmarkPaths:
 
 
 def run_round(audio_path: Path, reference_path: Path, round_number: int) -> Dict[str, Any]:
-    if not audio_path.exists():
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
     if not reference_path.exists():
         raise FileNotFoundError(f"Reference file not found: {reference_path}")
 
@@ -146,15 +252,29 @@ def run_round(audio_path: Path, reference_path: Path, round_number: int) -> Dict
 
     config = get_config()
     config_snapshot = _config_snapshot(config)
+    sample_rate = int(config.get("sample_rate", 44100))
+
+    ref_notes = _load_reference_notes(reference_path)
+    _maybe_generate_audio(audio_path, ref_notes, sample_rate)
+
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     start_time = time.time()
     result = transcribe_audio_pipeline(str(audio_path))
     elapsed = time.time() - start_time
 
-    ref_notes = load_reference_notes(reference_path)
-    pred_notes = load_predicted_notes(result.get("notes", []))
+    pred_notes = _load_predicted_notes(result.get("notes", []))
 
     metrics = compute_metrics(ref_notes, pred_notes)
+
+    catastrophic_mismatch = all(
+        float(metrics.get(k, 0.0)) == 0.0
+        for k in ("HM", "RPA", "OnsetF", "VoicingPrecision")
+    )
+    positive_signal = any(float(metrics.get(k, 0.0)) > 0.0 for k in ("RPA", "CA", "OA", "OnsetF"))
+
+    classification = "catastrophic_mismatch" if catastrophic_mismatch else "tuning_deferred" if not positive_signal else "normal"
 
     save_metrics(metrics, paths.metrics_path)
     paths.musicxml_path.write_text(result["musicxml"], encoding="utf-8")
@@ -164,12 +284,39 @@ def run_round(audio_path: Path, reference_path: Path, round_number: int) -> Dict
         "round": round_number,
         "config": config_snapshot,
         "metrics": metrics,
+        "classification": classification,
         "runtime_sec": elapsed,
         "timestamp": time.time(),
     }
     _append_history(paths.history_path, history_record)
 
-    updates = _propose_updates(metrics, config, previous_metrics)
+    updates: Dict[str, Any] = {}
+    debug_info: Dict[str, Any] | None = None
+
+    if catastrophic_mismatch:
+        debug_info = {
+            "status": "catastrophic_mismatch",
+            "reference_notes_preview": _note_debug_slice(ref_notes),
+            "predicted_notes_preview": _note_debug_slice(pred_notes),
+            "onset_offset_units": "seconds",
+            "pitch_units": "MIDI numbers (pitch_hz also available)",
+            "actions": [
+                "Verify onset/offset units are seconds in both reference and predictions.",
+                "Verify pitch comparison uses consistent units (MIDI or Hz).",
+            ],
+        }
+    elif positive_signal:
+        updates = _propose_updates(metrics, config, previous_metrics)
+    else:
+        debug_info = {
+            "status": "tuning_deferred",
+            "message": "Metric signals are all zero; skipping parameter tuning until a positive score is observed.",
+            "reference_notes_preview": _note_debug_slice(ref_notes),
+            "predicted_notes_preview": _note_debug_slice(pred_notes),
+            "onset_offset_units": "seconds",
+            "pitch_units": "MIDI numbers (pitch_hz also available)",
+        }
+
     new_config = update_config(updates) if updates else config
 
     best_hm_round = round_number
@@ -189,6 +336,7 @@ def run_round(audio_path: Path, reference_path: Path, round_number: int) -> Dict
         "metrics": metrics,
         "runtime_sec": elapsed,
         "updates_applied": updates,
+        "classification": classification,
         "config_after_updates": _config_snapshot(new_config),
         "best_hm": {
             "round": best_hm_round,
@@ -199,6 +347,9 @@ def run_round(audio_path: Path, reference_path: Path, round_number: int) -> Dict
         "musicxml_path": str(paths.musicxml_path),
         "midi_path": str(paths.midi_path),
     }
+
+    if debug_info:
+        summary["debug"] = debug_info
 
     paths.summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return summary
