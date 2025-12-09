@@ -1,0 +1,82 @@
+{
+  "best_hm": {
+    "HM": 0.0,
+    "metrics_path": "benchmarks_results/old_macdonald/old_macdonald_metrics_round1.json",
+    "round": 1
+  },
+  "config_after_updates": {
+    "confidence_floor": 0.12,
+    "ensemble_weights": {
+      "autocorr": 0.1,
+      "cqt": 0.2,
+      "crepe": 0.25,
+      "rmvpe": 0.25,
+      "spectral": 0.2,
+      "swift": 0.45,
+      "yin": 0.15
+    },
+    "fmax": 1883.7,
+    "fmin": 80.0,
+    "frame_length": 2048,
+    "hop_length": 512,
+    "median_window": 13,
+    "min_note_frames": 5,
+    "onset_threshold_factor": 0.3,
+    "ppq": 120,
+    "sample_rate": 44100
+  },
+  "history_path": "benchmarks_results/old_macdonald/history.jsonl",
+  "latest_config": {
+    "confidence_floor": 0.1,
+    "ensemble_weights": {
+      "autocorr": 0.1,
+      "cqt": 0.2,
+      "crepe": 0.25,
+      "rmvpe": 0.25,
+      "spectral": 0.2,
+      "swift": 0.4,
+      "yin": 0.2
+    },
+    "fmax": 2093,
+    "fmin": 65,
+    "frame_length": 2048,
+    "hop_length": 512,
+    "median_window": 11,
+    "min_note_frames": 3,
+    "onset_threshold_factor": 0.25,
+    "ppq": 120,
+    "sample_rate": 44100
+  },
+  "latest_metrics_path": "benchmarks_results/old_macdonald/old_macdonald_metrics_round1.json",
+  "latest_round": 1,
+  "metrics": {
+    "CA": 0.0,
+    "GEA": 1.0,
+    "HM": 0.0,
+    "OA": 0.0,
+    "OffsetPrecision": 0.0,
+    "OffsetRecall": 0.0,
+    "OnsetF": 0.0,
+    "OnsetOffsetF": 0.0,
+    "OnsetPrecision": 0.0,
+    "OnsetRecall": 0.0,
+    "RPA": 0.0,
+    "VoicingPrecision": 0.0,
+    "VoicingRecall": 0.0
+  },
+  "midi_path": "benchmarks_results/old_macdonald/old_macdonald_round1_pred.mid",
+  "musicxml_path": "benchmarks_results/old_macdonald/old_macdonald_round1_pred.musicxml",
+  "runtime_sec": 7.556251287460327,
+  "updates_applied": {
+    "confidence_floor": 0.12,
+    "ensemble_weights": {
+      "swift": 0.45,
+      "yin": 0.15
+    },
+    "fmax": 1883.7,
+    "fmin": 80.0,
+    "median_window": 13,
+    "min_note_frames": 5,
+    "onset_threshold_factor": 0.3
+  }
+}

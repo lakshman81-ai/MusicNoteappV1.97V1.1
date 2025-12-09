@@ -13,6 +13,8 @@ dist-ssr
 *.local
 __pycache__/
 *.pyc
+benchmarks/audio/*.wav
+benchmarks_results/old_macdonald/*.mid
 
 # Editor directories and files
 .vscode/*

@@ -178,9 +178,9 @@ def _aggregate(
             unstable[idx] = True
             continue
 
-        weights = np.asarray(frame_weights, dtype=float)
-        weights = weights / np.sum(weights)
-        pitches[idx] = float(np.sum(np.asarray(frame_candidates) * weights))
+        weight_vector = np.asarray(frame_weights, dtype=float)
+        weight_vector = weight_vector / np.sum(weight_vector)
+        pitches[idx] = float(np.sum(np.asarray(frame_candidates) * weight_vector))
         conf[idx] = float(np.mean(frame_conf))
     return pitches, conf, unstable
 
@@ -282,7 +282,7 @@ def extract_features(
         if window_vals.size:
             pitch_smooth[idx] = float(np.median(window_vals))
 
-    rms = librosa.feature.rms(y=y, frame_length=FRAME_LENGTH, hop_length=hop_length)[0]
+    rms = librosa.feature.rms(y=y, frame_length=params["frame_length"], hop_length=hop_length)[0]
     if rms.size < len(times):
         rms = np.pad(rms, (0, len(times) - rms.size), mode="edge")
     rms_floor = -40.0
@@ -333,7 +333,7 @@ def extract_features(
         else:
             stable_run = 0
 
-        if confidence < CONF_MIN:
+        if confidence < params["conf_min"]:
             low_conf_run += 1
         else:
             low_conf_run = 0
