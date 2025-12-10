@@ -12,3 +12,4 @@ crepe==0.0.12
 mir_eval==0.7
 pretty_midi==0.2.10
 pandas>=1.5.0
+demucs>=4.0.0

@@ -37,6 +37,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "target_lufs": -14.0,
     "silence_threshold_dbfs": 40.0,
     "min_duration_sec": 0.12,
+    "separation": {
+        "enabled": False,
+        "model": "htdemucs",
+        "device": "auto",
+        "normalize": True,
+        "target_lufs": -14.0,
+    },
     "confidence_floor": 0.10,
     "merge_gap_beats": 0.125,
     "min_staccato_ticks": 30,

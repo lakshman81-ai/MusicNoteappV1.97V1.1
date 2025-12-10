@@ -42,6 +42,24 @@ def _stage_b_params() -> dict:
     }
 
 
+def _mix_stems(meta: MetaData, names: List[str]) -> Tuple[np.ndarray, int] | None:
+    stems = meta.stems or {}
+    tracks = [stems[name] for name in names if name in stems and stems[name] is not None]
+    if not tracks:
+        return None
+
+    max_len = max(len(track) for track in tracks)
+    padded = []
+    for track in tracks:
+        pad_len = max_len - len(track)
+        if pad_len > 0:
+            track = np.pad(track, (0, pad_len), mode="constant")
+        padded.append(track.astype(np.float32))
+
+    mix = np.mean(np.stack(padded, axis=0), axis=0).astype(np.float32)
+    return mix, int(meta.stems_sr or meta.sample_rate)
+
+
 def _smooth_series(values: np.ndarray, window: int) -> np.ndarray:
     if window % 2 == 0:
         window += 1
@@ -356,6 +374,10 @@ def extract_features(
     """Stage B: ensemble pitch detection with deterministic rules."""
     params = _stage_b_params()
     hop_length = params["hop_length"]
+    swift_source = _mix_stems(meta, ["vocals", "bass"])
+    poly_source = _mix_stems(meta, ["other"])
+    swift_y, swift_sr = swift_source if swift_source else (y, sr)
+    poly_y, poly_sr = poly_source if poly_source else (y, sr)
     detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 
     yin_pitch, yin_conf = _detector_yin(
@@ -363,12 +385,12 @@ def extract_features(
     )
     detector_outputs["yin"] = (yin_pitch, yin_conf)
 
-    cqt_pitch, cqt_conf = _detector_cqt(y, sr, params["fmin"], params["fmax"], hop_length)
+    cqt_pitch, cqt_conf = _detector_cqt(poly_y, poly_sr, params["fmin"], params["fmax"], hop_length)
     detector_outputs["cqt"] = (cqt_pitch, cqt_conf)
 
     autocorr_pitch, autocorr_conf, autocorr_salience = _detector_autocorr(
-        y,
-        sr,
+        poly_y,
+        poly_sr,
         params["fmin"],
         params["fmax"],
         params["frame_length"],
@@ -382,7 +404,7 @@ def extract_features(
     )
     detector_outputs["autocorr"] = (autocorr_pitch, autocorr_conf)
 
-    swift_output = _detector_swift(y, sr, hop_length)
+    swift_output = _detector_swift(swift_y, swift_sr, hop_length)
     if swift_output is not None:
         detector_outputs["swift"] = swift_output
 

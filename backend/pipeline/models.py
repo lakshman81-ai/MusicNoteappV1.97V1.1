@@ -52,6 +52,11 @@ class MetaData:
     channel_orientation: str = "unknown"
     original_shape: Optional[Tuple[int, ...]] = None
     normalized_shape: Optional[Tuple[int, ...]] = None
+    stems: Optional[Dict[str, Any]] = None
+    stems_sr: Optional[int] = None
+    separation_model: Optional[str] = None
+    separation_device: Optional[str] = None
+    stem_lufs: Optional[Dict[str, float]] = None
 
 
 # ---------- Pitch timeline ----------
@@ -140,7 +145,7 @@ class AnalysisData:
             "meta": {
                 key: value
                 for key, value in asdict(self.meta).items()
-                if key != "preprocessed_audio"
+                if key not in {"preprocessed_audio", "stems"}
             },
             "timeline": [asdict(f) for f in self.timeline],
             "notes": [
