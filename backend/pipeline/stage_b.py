@@ -55,6 +55,21 @@ def _stage_b_params() -> dict:
     }
 
 
+def _apply_format_profile(params: dict, meta: MetaData) -> dict:
+    """Adjust detector thresholds based on the input container/quality."""
+
+    profile = (meta.input_format or "").lower()
+
+    if profile == "wav":
+        params["conf_min"] = 0.5
+        params["onset_threshold_factor"] = 0.35
+    elif profile == "mp3":
+        params["conf_min"] = 0.6
+        params["onset_threshold_factor"] = 0.18
+
+    return params
+
+
 def _mix_stems(meta: MetaData, names: List[str]) -> Tuple[np.ndarray, int] | None:
     stems = meta.stems or {}
     tracks = [stems[name] for name in names if name in stems and stems[name] is not None]
@@ -608,7 +623,7 @@ def extract_features(
     velocity_seed: int | None = None,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
     """Stage B: ensemble pitch detection with HMM-based segmentation."""
-    params = _stage_b_params()
+    params = _apply_format_profile(_stage_b_params(), meta)
     hop_length = params["hop_length"]
     harmonic_source = _mix_stems(meta, ["vocals", "bass", "other"])
     base_y, base_sr = harmonic_source if harmonic_source else (y, sr)
