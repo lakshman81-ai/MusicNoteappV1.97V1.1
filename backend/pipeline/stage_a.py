@@ -25,6 +25,18 @@ def _stage_a_params() -> dict:
     }
 
 
+def _separation_params() -> dict:
+    cfg = get_config().get("separation", {})
+    stage_params = _stage_a_params()
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "model": str(cfg.get("model", "htdemucs")),
+        "device": str(cfg.get("device", "auto")),
+        "normalize": bool(cfg.get("normalize", True)),
+        "target_lufs": float(cfg.get("target_lufs", stage_params["target_lufs"])),
+    }
+
+
 def _load_audio(audio_path: str) -> Tuple[np.ndarray, int]:
     """Load audio from disk preserving the native sample rate."""
 
@@ -184,17 +196,16 @@ def load_and_preprocess(
         end_sample = int(max_duration * original_sr)
         y = y[:end_sample]
 
-    separation_cfg: Dict[str, object] = get_config().get("separation", {})
-    separation_enabled = bool(separation_cfg.get("enabled", False))
-    separation_target_lufs = float(separation_cfg.get("target_lufs", params["target_lufs"]))
-    normalize_stems = bool(separation_cfg.get("normalize", True))
+    separation_cfg = _separation_params()
+    separation_target_lufs = float(separation_cfg["target_lufs"])
+    normalize_stems = bool(separation_cfg["normalize"])
     separation_result: SeparationResult | None = None
-    if separation_enabled:
+    if separation_cfg["enabled"]:
         separation_result = run_htdemucs(
             y,
             original_sr,
-            model_name=str(separation_cfg.get("model", "htdemucs")),
-            device_preference=str(separation_cfg.get("device", "auto")),
+            model_name=separation_cfg["model"],
+            device_preference=separation_cfg["device"],
         )
 
     if y.ndim > 1:
