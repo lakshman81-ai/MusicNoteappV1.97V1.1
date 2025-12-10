@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 
 import librosa
 import numpy as np
+from scipy import linalg, signal
 
 from backend.config_manager import get_config
 from .models import ChordEvent, FramePitch, MetaData, NoteEvent
@@ -32,6 +33,12 @@ def _stage_b_params() -> dict:
         "weights": default_weights,
         "onset_threshold_factor": float(cfg.get("onset_threshold_factor", 0.25)),
         "min_note_frames": int(cfg.get("min_note_frames", 3)),
+        "autocorr_split_hz": float(cfg.get("autocorr_split_hz", 1000.0)),
+        "autocorr_whitening_order": int(cfg.get("autocorr_whitening_order", 12)),
+        "autocorr_whitening_lambda": float(cfg.get("autocorr_whitening_lambda", 0.01)),
+        "autocorr_peak_threshold": float(cfg.get("autocorr_peak_threshold", 0.20)),
+        "autocorr_octave_compression": float(cfg.get("autocorr_octave_compression", 2.0)),
+        "autocorr_octave_suppression": float(cfg.get("autocorr_octave_suppression", 0.50)),
     }
 
 
@@ -81,25 +88,107 @@ def _detector_cqt(y: np.ndarray, sr: int, fmin: float, fmax: float, hop_length: 
     return pitches, conf
 
 
-def _detector_autocorr(y: np.ndarray, sr: int, fmin: float, fmax: float, frame_length: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray]:
+def _whiten_frame(frame: np.ndarray, order: int, reg: float) -> np.ndarray:
+    frame = frame - float(np.mean(frame))
+    if order <= 0 or not np.any(frame):
+        return frame
+
+    order = min(order, len(frame) - 1)
+    if order <= 0:
+        return frame
+
+    ac = librosa.autocorrelate(frame, max_size=order + 1)
+    if ac.size <= order:
+        return frame
+
+    toeplitz = linalg.toeplitz(ac[:-1]) + reg * np.eye(order)
+    rhs = -ac[1:]
+    try:
+        coeffs = linalg.solve(toeplitz, rhs, assume_a="pos")
+    except linalg.LinAlgError:
+        return frame
+
+    a = np.concatenate(([1.0], coeffs))
+    return signal.lfilter(a, [1.0], frame)
+
+
+def _design_band_filters(sr: int, split_hz: float) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
+    nyquist = sr / 2.0
+    split = np.clip(split_hz, 10.0, nyquist - 100.0)
+    norm_split = split / nyquist
+    low_b, low_a = signal.butter(4, norm_split, btype="low")
+    high_b, high_a = signal.butter(4, norm_split, btype="high")
+    return (low_b, low_a), (high_b, high_a)
+
+
+def _apply_octave_pruning(acf: np.ndarray, compression: float, suppression: float) -> np.ndarray:
+    if compression <= 1.0 or suppression <= 0.0:
+        return acf
+
+    compressed_len = max(1, int(np.ceil(len(acf) / compression)))
+    compressed = signal.resample(acf, compressed_len)
+    compressed_time = np.arange(compressed_len) * compression
+    compressed_full = np.interp(np.arange(len(acf)), compressed_time, compressed, left=compressed[0], right=0.0)
+    pruned = acf - suppression * compressed_full
+    return np.maximum(pruned, 0.0)
+
+
+def _detector_autocorr(
+    y: np.ndarray,
+    sr: int,
+    fmin: float,
+    fmax: float,
+    frame_length: int,
+    hop_length: int,
+    split_hz: float,
+    whitening_order: int,
+    whitening_lambda: float,
+    peak_threshold: float,
+    octave_compression: float,
+    octave_suppression: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     frames = librosa.util.frame(y, frame_length=frame_length, hop_length=hop_length).T
     min_lag = int(sr / fmax)
     max_lag = int(sr / fmin)
     pitches = np.full(frames.shape[0], np.nan, dtype=float)
     conf = np.zeros_like(pitches)
+    salience = np.zeros_like(pitches)
+
+    (low_b, low_a), (high_b, high_a) = _design_band_filters(sr, split_hz)
+
     for i, frame in enumerate(frames):
-        frame = frame - float(np.mean(frame))
-        if not np.any(frame):
+        whitened = _whiten_frame(frame.astype(float), whitening_order, whitening_lambda)
+        if not np.any(np.isfinite(whitened)):
             continue
-        ac = librosa.autocorrelate(frame)
-        ac[:min_lag] = 0
-        ac[max_lag:] = 0
-        peak_idx = int(np.argmax(ac))
-        if peak_idx <= 0:
+
+        low_band = signal.lfilter(low_b, low_a, whitened)
+        high_band = signal.lfilter(high_b, high_a, whitened)
+        high_band = np.maximum(high_band, 0.0)
+
+        ac_low = librosa.autocorrelate(low_band)
+        ac_high = librosa.autocorrelate(high_band)
+        ac_sum = ac_low + ac_high
+
+        if not np.any(np.isfinite(ac_sum)):
             continue
+
+        ac_sum = ac_sum / (np.max(np.abs(ac_sum)) + 1e-9)
+        ac_sum = _apply_octave_pruning(ac_sum, octave_compression, octave_suppression)
+
+        ac_sum[:min_lag] = 0.0
+        ac_sum[max_lag:] = 0.0
+
+        peak_idx = int(np.argmax(ac_sum))
+        peak_val = float(ac_sum[peak_idx]) if peak_idx > 0 else 0.0
+        salience[i] = peak_val
+
+        if peak_idx <= 0 or peak_val < peak_threshold:
+            continue
+
         pitches[i] = sr / float(peak_idx)
-        conf[i] = float(np.clip(ac[peak_idx] / (np.max(ac) + 1e-6), 0.0, 1.0))
-    return pitches, conf
+        conf[i] = float(np.clip(peak_val, 0.0, 1.0))
+
+    return pitches, conf, salience
 
 
 def _detector_swift(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray] | None:
@@ -277,8 +366,19 @@ def extract_features(
     cqt_pitch, cqt_conf = _detector_cqt(y, sr, params["fmin"], params["fmax"], hop_length)
     detector_outputs["cqt"] = (cqt_pitch, cqt_conf)
 
-    autocorr_pitch, autocorr_conf = _detector_autocorr(
-        y, sr, params["fmin"], params["fmax"], params["frame_length"], hop_length
+    autocorr_pitch, autocorr_conf, autocorr_salience = _detector_autocorr(
+        y,
+        sr,
+        params["fmin"],
+        params["fmax"],
+        params["frame_length"],
+        hop_length,
+        params["autocorr_split_hz"],
+        params["autocorr_whitening_order"],
+        params["autocorr_whitening_lambda"],
+        params["autocorr_peak_threshold"],
+        params["autocorr_octave_compression"],
+        params["autocorr_octave_suppression"],
     )
     detector_outputs["autocorr"] = (autocorr_pitch, autocorr_conf)
 
@@ -305,19 +405,28 @@ def extract_features(
         if window_vals.size:
             pitch_smooth[idx] = float(np.median(window_vals))
 
-    rms = librosa.feature.rms(y=y, frame_length=FRAME_LENGTH, hop_length=hop_length)[0]
+    rms = librosa.feature.rms(y=y, frame_length=params["frame_length"], hop_length=hop_length)[0]
     if rms.size < len(times):
         rms = np.pad(rms, (0, len(times) - rms.size), mode="edge")
     rms_floor = -40.0
     rms_ceiling = -4.0
 
     timeline: List[FramePitch] = []
-    for t, f, c, unstable_flag in zip(times, pitch_smooth, conf, unstable):
+    for idx, (t, f, c, unstable_flag) in enumerate(zip(times, pitch_smooth, conf, unstable)):
         midi = None
         if np.isfinite(f) and f > 0:
             midi_val = float(librosa.hz_to_midi(f))
             midi = int(round(midi_val)) if np.isfinite(midi_val) else None
-        timeline.append(FramePitch(time=float(t), pitch_hz=float(f) if np.isfinite(f) else 0.0, midi=midi, confidence=float(c)))
+        salience = float(autocorr_salience[idx]) if idx < len(autocorr_salience) else 0.0
+        timeline.append(
+            FramePitch(
+                time=float(t),
+                pitch_hz=float(f) if np.isfinite(f) else 0.0,
+                midi=midi,
+                confidence=float(c),
+                salience=salience,
+            )
+        )
         if unstable_flag:
             timeline[-1].confidence = max(float(c), params["conf_min"])
 
@@ -356,7 +465,7 @@ def extract_features(
         else:
             stable_run = 0
 
-        if confidence < CONF_MIN:
+        if confidence < params["conf_min"]:
             low_conf_run += 1
         else:
             low_conf_run = 0

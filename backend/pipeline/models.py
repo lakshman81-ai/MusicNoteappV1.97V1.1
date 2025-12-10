@@ -62,6 +62,7 @@ class FramePitch:
     pitch_hz: float
     midi: Optional[int]
     confidence: float
+    salience: float = 0.0
 
 
 # ---------- Note events ----------
