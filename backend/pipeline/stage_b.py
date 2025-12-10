@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 import librosa
 import numpy as np
 from scipy import linalg, signal
+from scipy.ndimage import gaussian_filter1d
 
 from backend.config_manager import get_config
 from .models import ChordEvent, FramePitch, MetaData, NoteEvent
@@ -39,6 +40,18 @@ def _stage_b_params() -> dict:
         "autocorr_peak_threshold": float(cfg.get("autocorr_peak_threshold", 0.20)),
         "autocorr_octave_compression": float(cfg.get("autocorr_octave_compression", 2.0)),
         "autocorr_octave_suppression": float(cfg.get("autocorr_octave_suppression", 0.50)),
+        "swift_peak_threshold": float(cfg.get("swift_peak_threshold", 0.15)),
+        "swift_peak_prominence": float(cfg.get("swift_peak_prominence", 0.05)),
+        "swift_gaussian_sigma": float(cfg.get("swift_gaussian_sigma", 1.0)),
+        "swift_max_peaks": int(cfg.get("swift_max_peaks", 5)),
+        "swift_polyphony_cap": int(cfg.get("swift_polyphony_cap", 2)),
+        "swift_softmax_min_hz": float(cfg.get("swift_softmax_min_hz", cfg.get("fmin", 65.0))),
+        "swift_softmax_max_hz": float(cfg.get("swift_softmax_max_hz", cfg.get("fmax", 2093.0))),
+        "swift_num_harmonics": int(cfg.get("swift_num_harmonics", 6)),
+        "swift_harmonic_width": int(cfg.get("swift_harmonic_width", 3)),
+        "swift_harmonic_attenuation": float(cfg.get("swift_harmonic_attenuation", 0.35)),
+        "swift_sacf_threshold": float(cfg.get("swift_sacf_threshold", 0.2)),
+        "swift_octave_tolerance_cents": float(cfg.get("swift_octave_tolerance_cents", 15.0)),
     }
 
 
@@ -322,8 +335,10 @@ def _detector_autocorr(
     return pitches, conf, salience
 
 
-def _detector_swift(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray] | None:
-    if importlib.util.find_spec("swift" ) is None and importlib.util.find_spec("swiftf0") is None:
+def _detector_swift(
+    y: np.ndarray, sr: int, hop_length: int, frame_length: int, params: dict
+) -> Tuple[np.ndarray, np.ndarray, List[List[Tuple[float, float]]]] | None:
+    if importlib.util.find_spec("swift") is None and importlib.util.find_spec("swiftf0") is None:
         return None
     try:
         swift = importlib.import_module("swift").SwiftF0
@@ -332,6 +347,15 @@ def _detector_swift(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray
             swift = importlib.import_module("swiftf0").SwiftF0
         except Exception:
             return None
+
+    def _run_swift(model_input: np.ndarray, model_sr: int, model_hop: int):
+        model = swift(sample_rate=model_sr)
+        result = model.infer(model_input, hop_size=model_hop)
+        pitches = np.asarray(result.get("f0_hz", []), dtype=float)
+        conf = np.asarray(result.get("confidence", np.ones_like(pitches)), dtype=float)
+        softmax = result.get("softmax") or result.get("probabilities") or result.get("probs") or None
+        softmax_arr = np.asarray(softmax, dtype=float) if softmax is not None else None
+        return pitches, conf, softmax_arr
 
     cfg = get_config()
     target_sr = 16000
@@ -348,22 +372,112 @@ def _detector_swift(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray
         swift_sr = sr
         swift_hop = hop_length
 
-    model = swift(sample_rate=swift_sr)
-    result = model.infer(y_swift, hop_size=swift_hop)
-    pitches = np.asarray(result["f0_hz"], dtype=float)
-    conf = np.asarray(result.get("confidence", np.ones_like(pitches)), dtype=float)
+    pitches, conf, softmax = _run_swift(y_swift, swift_sr, swift_hop)
+    if pitches.size == 0:
+        return None
+
+    freq_axis = _swift_frequency_axis(params["swift_max_peaks"], params["swift_softmax_min_hz"], params["swift_softmax_max_hz"])
+    candidates: List[List[Tuple[float, float]]] = []
+    if softmax is not None and softmax.ndim > 1:
+        freq_axis = _swift_frequency_axis(softmax.shape[1], params["swift_softmax_min_hz"], params["swift_softmax_max_hz"])
+        candidates = _extract_swift_candidates_from_softmax(
+            softmax,
+            freq_axis,
+            params["swift_peak_threshold"],
+            params["swift_peak_prominence"],
+            params["swift_gaussian_sigma"],
+            params["swift_max_peaks"],
+        )
+
+    # Fall back to the model pitch as a candidate when softmax is missing.
+    if not candidates:
+        candidates = [[(float(f), float(c))] if np.isfinite(f) and f > 0 else [] for f, c in zip(pitches, conf)]
+
+    validated = _validate_swift_with_sacf(
+        y_swift, swift_sr, swift_hop, candidates, params["swift_sacf_threshold"], frame_length
+    )
+    pruned_validated = [_prune_harmonic_ghosts(frame, params["swift_octave_tolerance_cents"]) for frame in validated]
+
+    primary_freqs = np.full(len(pruned_validated), np.nan, dtype=float)
+    primary_conf = np.zeros(len(pruned_validated), dtype=float)
+    for idx, frame in enumerate(pruned_validated):
+        if frame:
+            primary_freqs[idx] = frame[0][0]
+            primary_conf[idx] = frame[0][1]
+
+    # Iterative spectral subtraction to reveal quieter notes.
+    residual_candidates: List[List[Tuple[float, float]]] = []
+    if params["swift_polyphony_cap"] > 1:
+        residual_signal = _spectral_subtract_harmonics(
+            y_swift,
+            swift_sr,
+            swift_hop,
+            frame_length,
+            primary_freqs,
+            params["swift_num_harmonics"],
+            params["swift_harmonic_width"],
+            params["swift_harmonic_attenuation"],
+        )
+        residual_pitches, residual_conf, residual_softmax = _run_swift(residual_signal, swift_sr, swift_hop)
+        freq_axis_residual = freq_axis
+        if residual_softmax is not None and residual_softmax.ndim > 1:
+            if residual_softmax.shape[1] != freq_axis.shape[0]:
+                freq_axis_residual = _swift_frequency_axis(
+                    residual_softmax.shape[1], params["swift_softmax_min_hz"], params["swift_softmax_max_hz"]
+                )
+            residual_candidates = _extract_swift_candidates_from_softmax(
+                residual_softmax,
+                freq_axis_residual,
+                params["swift_peak_threshold"],
+                params["swift_peak_prominence"],
+                params["swift_gaussian_sigma"],
+                params["swift_max_peaks"],
+            )
+        if not residual_candidates:
+            residual_candidates = [
+                [(float(f), float(c))] if np.isfinite(f) and f > 0 else [] for f, c in zip(residual_pitches, residual_conf)
+            ]
+        residual_validated = _validate_swift_with_sacf(
+            residual_signal,
+            swift_sr,
+            swift_hop,
+            residual_candidates,
+            params["swift_sacf_threshold"],
+            frame_length,
+        )
+    else:
+        residual_validated = []
+
+    merged_candidates: List[List[Tuple[float, float]]] = []
+    for idx in range(max(len(pruned_validated), len(residual_validated))):
+        frame: List[Tuple[float, float]] = []
+        if idx < len(pruned_validated):
+            frame.extend(pruned_validated[idx])
+        if idx < len(residual_validated):
+            frame.extend(residual_validated[idx])
+        frame = _prune_harmonic_ghosts(frame, params["swift_octave_tolerance_cents"])
+        frame.sort(key=lambda pair: pair[1], reverse=True)
+        merged_candidates.append(frame[: params["swift_polyphony_cap"]])
+
+    merged_primary = np.full(len(merged_candidates), np.nan, dtype=float)
+    merged_conf = np.zeros(len(merged_candidates), dtype=float)
+    for idx, frame in enumerate(merged_candidates):
+        if frame:
+            merged_primary[idx] = frame[0][0]
+            merged_conf[idx] = frame[0][1]
 
     swift_duration = len(y_swift) / float(swift_sr) if swift_sr > 0 else 0.0
     original_duration = len(y) / float(sr) if sr > 0 else 0.0
     time_scale = (original_duration / swift_duration) if swift_duration > 0 else 1.0
-    swift_times = np.arange(len(pitches)) * (swift_hop / float(swift_sr)) * time_scale
+    swift_times = np.arange(len(merged_primary)) * (swift_hop / float(swift_sr)) * time_scale
     target_frames = int(np.ceil(len(y) / hop_length))
     target_times = np.arange(target_frames) * (hop_length / float(sr))
 
-    aligned_pitches = np.interp(target_times, swift_times, pitches, left=np.nan, right=np.nan)
-    aligned_conf = np.interp(target_times, swift_times, conf, left=0.0, right=0.0)
+    aligned_pitches = np.interp(target_times, swift_times, merged_primary, left=np.nan, right=np.nan)
+    aligned_conf = np.interp(target_times, swift_times, merged_conf, left=0.0, right=0.0)
+    aligned_candidates = _align_candidates_to_targets(swift_times, target_times, merged_candidates)
 
-    return aligned_pitches, aligned_conf
+    return aligned_pitches, aligned_conf, aligned_candidates
 
 
 def _detector_crepe(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray] | None:
@@ -523,9 +637,11 @@ def extract_features(
     )
     detector_outputs["autocorr"] = (autocorr_pitch, autocorr_conf)
 
-    swift_output = _detector_swift(swift_y, swift_sr, hop_length)
+    swift_candidates: List[List[Tuple[float, float]]] = []
+    swift_output = _detector_swift(swift_y, swift_sr, hop_length, params["frame_length"], params)
     if swift_output is not None:
-        detector_outputs["swift"] = swift_output
+        aligned_pitches, aligned_conf, swift_candidates = swift_output
+        detector_outputs["swift"] = (aligned_pitches, aligned_conf)
 
     crepe_output = _detector_crepe(base_y, base_sr, hop_length) if use_crepe else None
     if crepe_output is not None:
@@ -558,7 +674,9 @@ def extract_features(
         if np.isfinite(f) and f > 0:
             midi_val = float(librosa.hz_to_midi(f))
             midi = int(round(midi_val)) if np.isfinite(midi_val) else None
-        salience = float(autocorr_salience[idx]) if idx < len(autocorr_salience) else 0.0
+        swift_salience = swift_candidates[idx][0][1] if idx < len(swift_candidates) and swift_candidates[idx] else 0.0
+        autocorr_val = float(autocorr_salience[idx]) if idx < len(autocorr_salience) else 0.0
+        salience = max(swift_salience, autocorr_val)
         timeline.append(
             FramePitch(
                 time=float(t),
