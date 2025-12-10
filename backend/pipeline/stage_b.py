@@ -112,11 +112,34 @@ def _detector_swift(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray
             swift = importlib.import_module("swiftf0").SwiftF0
         except Exception:
             return None
-    model = swift(sample_rate=sr)
-    result = model.infer(y, hop_size=hop_length)
+
+    cfg = get_config()
+    target_sr = 16000
+    pipeline_sr = int(cfg.get("sample_rate", sr))
+    already_at_target_sr = sr == target_sr or (pipeline_sr == target_sr and sr == pipeline_sr)
+
+    if already_at_target_sr:
+        y_swift = y
+        swift_sr = sr
+        swift_hop = hop_length
+    else:
+        y_swift = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+        swift_sr = target_sr
+        swift_hop = int(round(hop_length * target_sr / sr))
+
+    model = swift(sample_rate=swift_sr)
+    result = model.infer(y_swift, hop_size=swift_hop)
     pitches = np.asarray(result["f0_hz"], dtype=float)
     conf = np.asarray(result.get("confidence", np.ones_like(pitches)), dtype=float)
-    return pitches, conf
+
+    swift_times = np.arange(len(pitches)) * (swift_hop / float(swift_sr))
+    target_frames = int(np.ceil(len(y) / hop_length))
+    target_times = np.arange(target_frames) * (hop_length / float(sr))
+
+    aligned_pitches = np.interp(target_times, swift_times, pitches, left=np.nan, right=np.nan)
+    aligned_conf = np.interp(target_times, swift_times, conf, left=0.0, right=0.0)
+
+    return aligned_pitches, aligned_conf
 
 
 def _detector_crepe(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray, np.ndarray] | None:
