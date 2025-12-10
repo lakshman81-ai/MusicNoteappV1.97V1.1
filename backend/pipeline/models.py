@@ -46,6 +46,7 @@ class MetaData:
     # Legacy/auxiliary fields kept for compatibility
     tuning_offset: float = 0.0
     lufs: Optional[float] = None
+    input_format: Optional[str] = None
     processing_mode: str = "mono"
     snr: Optional[float] = None
     window_size: int = 2048

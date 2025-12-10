@@ -7,6 +7,7 @@ import librosa
 import numpy as np
 import pyloudnorm as pyln
 import soundfile as sf
+from scipy import signal
 
 from backend.config_manager import get_config
 from .separation import SeparationResult, run_htdemucs
@@ -47,6 +48,32 @@ def _load_audio(audio_path: str) -> Tuple[np.ndarray, int]:
         data, sr = librosa.load(path_str, sr=None, mono=False)
     y = np.asarray(data, dtype=np.float32)
     return y, int(sr)
+
+
+def _detect_input_format(audio_path: str) -> str:
+    """Infer the audio container/format from the file suffix."""
+
+    suffix = Path(audio_path).suffix.lower().lstrip(".")
+    if suffix in {"wav", "wave"}:
+        return "wav"
+    if suffix == "mp3":
+        return "mp3"
+    return suffix or "unknown"
+
+
+def _apply_lowpass_filter(y: np.ndarray, sr: int, cutoff_hz: float = 16000.0, order: int = 8) -> np.ndarray:
+    """Apply a steep low-pass filter to suppress high-frequency artifacts."""
+
+    nyquist = sr / 2.0
+    if nyquist <= 0 or cutoff_hz >= nyquist:
+        return y.astype(np.float32)
+
+    norm_cutoff = cutoff_hz / nyquist
+    b, a = signal.butter(order, norm_cutoff, btype="lowpass")
+    try:
+        return signal.lfilter(b, a, y).astype(np.float32)
+    except Exception:
+        return y.astype(np.float32)
 
 
 def _to_mono(y: np.ndarray) -> np.ndarray:
@@ -178,6 +205,7 @@ def load_and_preprocess(
     """
 
     audio_path = str(Path(audio_path))
+    input_format = _detect_input_format(audio_path)
     params = _stage_a_params()
     target_sr = target_sr or params["target_sr"]
     y, original_sr = _load_audio(audio_path)
@@ -215,6 +243,9 @@ def load_and_preprocess(
         y, processing_mode = _mid_side_select(y)
     else:
         y = _to_mono(y)
+
+    if input_format == "mp3":
+        y = _apply_lowpass_filter(y, original_sr)
 
     y = y - float(np.mean(y))
 
@@ -292,6 +323,7 @@ def load_and_preprocess(
         tempo_bpm=None,
         detected_key=None,
         lufs=loudness,
+        input_format=input_format,
         signal_rms_db=rms_db,
         peak_level=peak_level,
         preprocessed_audio=y_norm.astype(np.float32),
