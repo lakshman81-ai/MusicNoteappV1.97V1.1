@@ -223,23 +223,27 @@ def _detector_swift(y: np.ndarray, sr: int, hop_length: int) -> Tuple[np.ndarray
     cfg = get_config()
     target_sr = 16000
     pipeline_sr = int(cfg.get("sample_rate", sr))
-    already_at_target_sr = sr == target_sr or (pipeline_sr == target_sr and sr == pipeline_sr)
+    pipeline_at_target_sr = pipeline_sr == target_sr
+    already_at_target_sr = sr == target_sr or (pipeline_at_target_sr and sr == pipeline_sr)
 
-    if already_at_target_sr:
-        y_swift = y
-        swift_sr = sr
-        swift_hop = hop_length
-    else:
+    if not already_at_target_sr:
         y_swift = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
         swift_sr = target_sr
         swift_hop = int(round(hop_length * target_sr / sr))
+    else:
+        y_swift = y
+        swift_sr = sr
+        swift_hop = hop_length
 
     model = swift(sample_rate=swift_sr)
     result = model.infer(y_swift, hop_size=swift_hop)
     pitches = np.asarray(result["f0_hz"], dtype=float)
     conf = np.asarray(result.get("confidence", np.ones_like(pitches)), dtype=float)
 
-    swift_times = np.arange(len(pitches)) * (swift_hop / float(swift_sr))
+    swift_duration = len(y_swift) / float(swift_sr) if swift_sr > 0 else 0.0
+    original_duration = len(y) / float(sr) if sr > 0 else 0.0
+    time_scale = (original_duration / swift_duration) if swift_duration > 0 else 1.0
+    swift_times = np.arange(len(pitches)) * (swift_hop / float(swift_sr)) * time_scale
     target_frames = int(np.ceil(len(y) / hop_length))
     target_times = np.arange(target_frames) * (hop_length / float(sr))
 
