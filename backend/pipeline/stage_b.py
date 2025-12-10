@@ -146,7 +146,9 @@ def _apply_octave_pruning(acf: np.ndarray, compression: float, suppression: floa
     compressed_len = max(1, int(np.ceil(len(acf) / compression)))
     compressed = signal.resample(acf, compressed_len)
     compressed_time = np.arange(compressed_len) * compression
-    compressed_full = np.interp(np.arange(len(acf)), compressed_time, compressed, left=compressed[0], right=0.0)
+    compressed_full = np.interp(
+        np.arange(len(acf)), compressed_time, compressed, left=compressed[0], right=0.0
+    )
     pruned = acf - suppression * compressed_full
     return np.maximum(pruned, 0.0)
 
@@ -180,24 +182,27 @@ def _detector_autocorr(
             continue
 
         low_band = signal.lfilter(low_b, low_a, whitened)
-        high_band = signal.lfilter(high_b, high_a, whitened)
-        high_band = np.maximum(high_band, 0.0)
+        high_band = np.maximum(signal.lfilter(high_b, high_a, whitened), 0.0)
 
         ac_low = librosa.autocorrelate(low_band)
         ac_high = librosa.autocorrelate(high_band)
-        ac_sum = ac_low + ac_high
 
-        if not np.any(np.isfinite(ac_sum)):
+        max_len = min(len(ac_low), len(ac_high))
+        if max_len == 0:
             continue
 
-        ac_sum = ac_sum / (np.max(np.abs(ac_sum)) + 1e-9)
-        ac_sum = _apply_octave_pruning(ac_sum, octave_compression, octave_suppression)
+        summary_acf = ac_low[:max_len] + ac_high[:max_len]
+        if not np.any(np.isfinite(summary_acf)):
+            continue
 
-        ac_sum[:min_lag] = 0.0
-        ac_sum[max_lag:] = 0.0
+        summary_acf = summary_acf / (np.max(np.abs(summary_acf)) + 1e-9)
+        summary_acf = _apply_octave_pruning(summary_acf, octave_compression, octave_suppression)
 
-        peak_idx = int(np.argmax(ac_sum))
-        peak_val = float(ac_sum[peak_idx]) if peak_idx > 0 else 0.0
+        summary_acf[:min_lag] = 0.0
+        summary_acf[max_lag:] = 0.0
+
+        peak_idx = int(np.argmax(summary_acf))
+        peak_val = float(summary_acf[peak_idx]) if peak_idx > 0 else 0.0
         salience[i] = peak_val
 
         if peak_idx <= 0 or peak_val < peak_threshold:
