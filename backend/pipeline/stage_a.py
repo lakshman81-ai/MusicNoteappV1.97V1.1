@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Tuple
 
 import librosa
 import numpy as np
@@ -9,6 +9,7 @@ import pyloudnorm as pyln
 import soundfile as sf
 
 from backend.config_manager import get_config
+from .separation import SeparationResult, run_htdemucs
 from .models import MetaData
 
 
@@ -62,19 +63,22 @@ def _normalize_channel_orientation(y: np.ndarray) -> tuple[np.ndarray, str, bool
     return y.astype(np.float32), "samples_first", False
 
 
-def _trim_silence(y: np.ndarray, top_db: float) -> np.ndarray:
-    """Trim leading and trailing silence using an energy threshold."""
+def _trim_silence(y: np.ndarray, top_db: float) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Trim leading and trailing silence using an energy threshold.
+
+    Returns the trimmed audio and the sample indices (start, end) used for trimming.
+    """
 
     try:
         non_silent_indices = librosa.effects.split(y, top_db=top_db)
     except Exception:
-        return y.astype(np.float32)
+        return y.astype(np.float32), (0, len(y))
 
     if non_silent_indices.size == 0:
-        return np.array([], dtype=np.float32)
+        return np.array([], dtype=np.float32), (0, 0)
 
     start, end = non_silent_indices[0][0], non_silent_indices[-1][1]
-    return y[start:end].astype(np.float32)
+    return y[start:end].astype(np.float32), (int(start), int(end))
 
 
 def _resample(y: np.ndarray, sr: int, target_sr: int, fallback_sr: int | None = None) -> Tuple[np.ndarray, int]:
@@ -180,6 +184,19 @@ def load_and_preprocess(
         end_sample = int(max_duration * original_sr)
         y = y[:end_sample]
 
+    separation_cfg: Dict[str, object] = get_config().get("separation", {})
+    separation_enabled = bool(separation_cfg.get("enabled", False))
+    separation_target_lufs = float(separation_cfg.get("target_lufs", params["target_lufs"]))
+    normalize_stems = bool(separation_cfg.get("normalize", True))
+    separation_result: SeparationResult | None = None
+    if separation_enabled:
+        separation_result = run_htdemucs(
+            y,
+            original_sr,
+            model_name=str(separation_cfg.get("model", "htdemucs")),
+            device_preference=str(separation_cfg.get("device", "auto")),
+        )
+
     if y.ndim > 1:
         y = y.astype(np.float32)
     processing_mode = "mono"
@@ -190,7 +207,20 @@ def load_and_preprocess(
 
     y = y - float(np.mean(y))
 
-    y_trimmed = _trim_silence(y, top_db=params["silence_threshold_dbfs"])
+    y_trimmed, trim_bounds = _trim_silence(y, top_db=params["silence_threshold_dbfs"])
+
+    if separation_result and separation_result.stems:
+        start_idx, end_idx = trim_bounds
+        start_time = start_idx / float(original_sr) if original_sr > 0 else 0.0
+        end_time = end_idx / float(original_sr) if original_sr > 0 else 0.0
+        trimmed_stems: Dict[str, np.ndarray] = {}
+        for name, stem_audio in separation_result.stems.items():
+            stem_sr = separation_result.sample_rate
+            stem_start = int(round(start_time * stem_sr))
+            stem_end = int(round(end_time * stem_sr))
+            trimmed = stem_audio[stem_start:stem_end]
+            trimmed_stems[name] = _to_mono(trimmed)
+        separation_result.stems = trimmed_stems
 
     if y_trimmed.size == 0:
         raise ValueError("Audio contains only silence after trimming")
@@ -202,6 +232,27 @@ def load_and_preprocess(
     y_resampled, sr_out = _resample(
         y_trimmed, original_sr, target_sr, fallback_sr=params["fallback_sr"]
     )
+
+    stem_tracks: Dict[str, np.ndarray] | None = None
+    stem_lufs: Dict[str, float] | None = None
+    if separation_result and separation_result.stems:
+        stem_tracks = {}
+        stem_lufs = {}
+        for name, stem_audio in separation_result.stems.items():
+            try:
+                stem_resampled, _ = _resample(stem_audio, separation_result.sample_rate, sr_out)
+            except Exception:
+                stem_resampled = stem_audio.astype(np.float32)
+            if normalize_stems:
+                stem_norm, stem_loudness = _normalize_loudness(
+                    stem_resampled, sr_out, separation_target_lufs
+                )
+            else:
+                stem_norm = stem_resampled.astype(np.float32)
+                stem_loudness = None
+            stem_tracks[name] = stem_norm.astype(np.float32)
+            if stem_loudness is not None:
+                stem_lufs[name] = stem_loudness
 
     try:
         tuning_offset = float(librosa.estimate_tuning(y=y_resampled, sr=sr_out) * 100.0)
@@ -240,5 +291,12 @@ def load_and_preprocess(
     meta.channel_orientation = orientation if not transposed else "samples_first"
     meta.original_shape = input_shape
     meta.normalized_shape = normalized_shape
+
+    if stem_tracks:
+        meta.stems = stem_tracks
+        meta.stems_sr = sr_out
+        meta.stem_lufs = stem_lufs
+        meta.separation_model = separation_result.model_name if separation_result else None
+        meta.separation_device = separation_result.device if separation_result else None
 
     return y_norm.astype(np.float32), sr_out, meta

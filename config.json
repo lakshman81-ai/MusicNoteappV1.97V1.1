@@ -28,6 +28,13 @@
   "target_lufs": -14.0,
   "silence_threshold_dbfs": 40.0,
   "min_duration_sec": 0.12,
+  "separation": {
+    "enabled": false,
+    "model": "htdemucs",
+    "device": "auto",
+    "normalize": true,
+    "target_lufs": -14.0
+  },
   "confidence_floor": 0.1,
   "merge_gap_beats": 0.125,
   "min_staccato_ticks": 30,
