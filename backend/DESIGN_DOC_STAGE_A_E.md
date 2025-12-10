@@ -7,6 +7,8 @@ The system processes audio through a five-stage pipeline (A→E) that extracts p
 - Load audio at the configured `sample_rate`, falling back to `fallback_sample_rate` when needed.
 - Normalize loudness toward `target_lufs` while observing `silence_threshold_dbfs` to trim leading/trailing silence.
 - Capture metadata such as detected tempo, beat overrides, and RMS/peak levels for downstream decisions.
+- Optionally run HTDemucs source separation (GPU/MPS/CPU selectable) to produce `vocals`, `bass`, `drums`, and `other` stems;
+  stems are loudness-normalized to the Stage A target and persisted into metadata for downstream routing.
 
 ## Stage B – Feature Extraction and Pitch Tracking
 - Compute spectral features with `frame_length` / `hop_length` and median smoothing (`median_window`).

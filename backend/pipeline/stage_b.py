@@ -374,14 +374,16 @@ def extract_features(
     """Stage B: ensemble pitch detection with deterministic rules."""
     params = _stage_b_params()
     hop_length = params["hop_length"]
+    harmonic_source = _mix_stems(meta, ["vocals", "bass", "other"])
+    base_y, base_sr = harmonic_source if harmonic_source else (y, sr)
     swift_source = _mix_stems(meta, ["vocals", "bass"])
     poly_source = _mix_stems(meta, ["other"])
-    swift_y, swift_sr = swift_source if swift_source else (y, sr)
-    poly_y, poly_sr = poly_source if poly_source else (y, sr)
+    swift_y, swift_sr = swift_source if swift_source else (base_y, base_sr)
+    poly_y, poly_sr = poly_source if poly_source else (base_y, base_sr)
     detector_outputs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 
     yin_pitch, yin_conf = _detector_yin(
-        y, sr, params["fmin"], params["fmax"], params["frame_length"], hop_length
+        base_y, base_sr, params["fmin"], params["fmax"], params["frame_length"], hop_length
     )
     detector_outputs["yin"] = (yin_pitch, yin_conf)
 
@@ -408,14 +410,14 @@ def extract_features(
     if swift_output is not None:
         detector_outputs["swift"] = swift_output
 
-    crepe_output = _detector_crepe(y, sr, hop_length) if use_crepe else None
+    crepe_output = _detector_crepe(base_y, base_sr, hop_length) if use_crepe else None
     if crepe_output is not None:
         detector_outputs["crepe"] = crepe_output
 
     pitches, conf, unstable = _aggregate(detector_outputs, params["conf_min"], params["weights"])
     conf = np.clip(conf, 0.0, 1.0)
     conf = np.maximum(conf, params["conf_min"])
-    times = librosa.times_like(pitches, sr=sr, hop_length=hop_length)
+    times = librosa.times_like(pitches, sr=base_sr, hop_length=hop_length)
 
     # Median smoothing respecting NaNs
     pitch_smooth = pitches.copy()
@@ -427,7 +429,7 @@ def extract_features(
         if window_vals.size:
             pitch_smooth[idx] = float(np.median(window_vals))
 
-    rms = librosa.feature.rms(y=y, frame_length=params["frame_length"], hop_length=hop_length)[0]
+    rms = librosa.feature.rms(y=base_y, frame_length=params["frame_length"], hop_length=hop_length)[0]
     if rms.size < len(times):
         rms = np.pad(rms, (0, len(times) - rms.size), mode="edge")
     rms_floor = -40.0
@@ -457,7 +459,7 @@ def extract_features(
     silence_frames_required = int(np.ceil(0.12 / frame_duration))
 
     # Spectral flux for onset/silence gating
-    stft = np.abs(librosa.stft(y, n_fft=1024, hop_length=hop_length))
+    stft = np.abs(librosa.stft(base_y, n_fft=1024, hop_length=hop_length))
     flux = np.sqrt(np.sum(np.square(np.diff(stft, axis=1).clip(min=0)), axis=0))
     flux_threshold = params["onset_threshold_factor"] * np.median(np.abs(flux)) if flux.size else 0.0
 
@@ -536,6 +538,6 @@ def extract_features(
         notes.append(current_note)
 
     meta.pitch_tracker = "ensemble"
-    chords = _detect_chords_from_chroma(y, sr, hop_length)
+    chords = _detect_chords_from_chroma(base_y, base_sr, hop_length)
 
     return timeline, notes, chords

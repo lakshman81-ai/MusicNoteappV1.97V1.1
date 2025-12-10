@@ -21,11 +21,22 @@ def _select_device(preference: str) -> str:
         return "cpu"
 
     pref = (preference or "auto").lower()
-    if pref == "cpu":
+    has_cuda = torch.cuda.is_available()
+    has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+    if pref in {"cpu"}:
         return "cpu"
-    if pref == "cuda" and torch.cuda.is_available():
+    if pref in {"cuda", "gpu"} and has_cuda:
         return "cuda"
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if pref == "mps" and has_mps:
+        return "mps"
+
+    if pref == "auto":
+        if has_cuda:
+            return "cuda"
+        if has_mps:
+            return "mps"
+    return "cuda" if has_cuda else "mps" if has_mps else "cpu"
 
 
 def run_htdemucs(
