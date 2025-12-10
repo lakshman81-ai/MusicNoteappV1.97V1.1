@@ -5,9 +5,13 @@ from typing import Dict, Tuple
 
 import librosa
 import numpy as np
-import pyloudnorm as pyln
 import soundfile as sf
 from scipy import signal
+
+try:  # Optional dependency used for LUFS normalization.
+    import pyloudnorm as pyln
+except ModuleNotFoundError:  # pragma: no cover - exercised via fallback path.
+    pyln = None
 
 from backend.config_manager import get_config
 from .separation import SeparationResult, run_htdemucs
@@ -138,13 +142,17 @@ def _resample(y: np.ndarray, sr: int, target_sr: int, fallback_sr: int | None = 
 def _normalize_loudness(y: np.ndarray, sr: int, target_lufs: float) -> Tuple[np.ndarray, float | None]:
     """Normalize loudness to a target LUFS while enforcing peak ∈ [−1, 1]."""
 
-    try:
-        meter = pyln.Meter(sr)
-        loudness = meter.integrated_loudness(y)
-        y_norm = pyln.normalize.loudness(y, loudness, target_lufs)
-    except Exception:
+    loudness = None
+    if pyln is not None:
+        try:
+            meter = pyln.Meter(sr)
+            loudness = meter.integrated_loudness(y)
+            y_norm = pyln.normalize.loudness(y, loudness, target_lufs)
+        except Exception:
+            y_norm = y.astype(np.float32)
+            loudness = None
+    else:
         y_norm = y.astype(np.float32)
-        loudness = None
 
     peak = float(np.max(np.abs(y_norm)))
     if peak > 0:
