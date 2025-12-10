@@ -84,152 +84,117 @@ def _smooth_series(values: np.ndarray, window: int) -> np.ndarray:
     return smoothed
 
 
-def _swift_frequency_axis(num_bins: int, fmin: float, fmax: float) -> np.ndarray:
-    num_bins = max(1, int(num_bins))
-    return np.linspace(fmin, fmax, num_bins)
+def _estimate_tuning_offset(timeline: List[FramePitch]) -> float:
+    """Estimate tuning offset in cents from the nearest MIDI bins."""
+
+    cents_diffs: List[float] = []
+    weights: List[float] = []
+    for frame in timeline:
+        if frame.pitch_hz <= 0 or frame.confidence <= 0:
+            continue
+        midi_val = float(librosa.hz_to_midi(frame.pitch_hz))
+        nearest = round(midi_val)
+        cents = 1200.0 * np.log2(frame.pitch_hz / float(librosa.midi_to_hz(nearest)))
+        cents_diffs.append(float(cents))
+        weights.append(float(frame.confidence))
+
+    if not cents_diffs:
+        return 0.0
+
+    bins = np.linspace(-50.0, 50.0, 41)  # 2.5-cent bins
+    hist, edges = np.histogram(cents_diffs, bins=bins, weights=weights)
+    if not np.any(hist):
+        return 0.0
+
+    best_idx = int(np.argmax(hist))
+    center = 0.5 * (edges[best_idx] + edges[best_idx + 1])
+    return float(center)
 
 
-def _extract_swift_candidates_from_softmax(
-    softmax: np.ndarray,
-    freq_axis: np.ndarray,
-    peak_threshold: float,
-    prominence: float,
-    gaussian_sigma: float,
-    max_peaks: int,
-) -> List[List[Tuple[float, float]]]:
-    if softmax is None or softmax.size == 0:
+def _decode_hmm_states(timeline: List[FramePitch], frame_duration: float, min_note_frames: int) -> List[str]:
+    """
+    Lightweight 3-state HMM (silence/attack/stable) over the pitch timeline.
+
+    Uses confidence, SACF salience, and simple transition priors to encourage
+    realistic attack–sustain–release flows while enforcing minimum dwell times.
+    """
+
+    states = ["silence", "attack", "stable"]
+
+    log_prior = np.log(np.asarray([0.6, 0.2, 0.2]))
+    log_trans = np.log(
+        np.array(
+            [
+                [0.85, 0.10, 0.05],  # silence -> {silence, attack, stable}
+                [0.15, 0.65, 0.20],  # attack  -> {silence, attack, stable}
+                [0.20, 0.10, 0.70],  # stable  -> {silence, attack, stable}
+            ]
+        )
+    )
+
+    def _emission_log_prob(frame: FramePitch, state: str) -> float:
+        voiced = frame.pitch_hz > 0
+        conf = float(np.clip(frame.confidence, 0.0, 1.0))
+        sal = float(np.clip(frame.salience, 0.0, 1.0))
+        base = 1e-6
+
+        if state == "silence":
+            likelihood = base + (1.2 - conf) * (1.0 - 0.3 * sal)
+            return float(np.log(max(likelihood, base)))
+
+        if state == "attack":
+            likelihood = base + conf * 0.55 + sal * 0.35 + (0.15 if voiced else -0.2)
+            return float(np.log(max(likelihood, base)))
+
+        # stable
+        likelihood = base + conf * 0.75 + sal * 0.4 + (0.2 if voiced else -0.4)
+        return float(np.log(max(likelihood, base)))
+
+    n_frames = len(timeline)
+    if n_frames == 0:
         return []
 
-    if softmax.ndim == 1:
-        softmax = softmax[None, :]
+    dp = np.full((len(states), n_frames), -np.inf)
+    backptr = np.full((len(states), n_frames), -1, dtype=int)
 
-    if freq_axis.shape[0] != softmax.shape[1]:
-        freq_axis = _swift_frequency_axis(softmax.shape[1], float(freq_axis[0]), float(freq_axis[-1]))
+    # initialization
+    first_emissions = [_emission_log_prob(timeline[0], s) for s in states]
+    for idx, em in enumerate(first_emissions):
+        dp[idx, 0] = log_prior[idx] + em
 
-    smoothed = gaussian_filter1d(softmax, sigma=max(gaussian_sigma, 0.0), axis=1, mode="nearest")
-    candidates: List[List[Tuple[float, float]]] = []
+    # Viterbi forward pass
+    for t in range(1, n_frames):
+        frame = timeline[t]
+        emissions = [_emission_log_prob(frame, s) for s in states]
+        for s_idx, emission in enumerate(emissions):
+            prev_scores = dp[:, t - 1] + log_trans[:, s_idx]
+            best_prev = int(np.argmax(prev_scores))
+            dp[s_idx, t] = prev_scores[best_prev] + emission
+            backptr[s_idx, t] = best_prev
 
-    for frame_probs in smoothed:
-        peaks, props = signal.find_peaks(frame_probs, height=peak_threshold, prominence=prominence)
-        frame_candidates = []
-        for idx in peaks:
-            prob = float(frame_probs[idx])
-            if not np.isfinite(prob):
-                continue
-            frame_candidates.append((float(freq_axis[idx]), prob))
-        frame_candidates.sort(key=lambda pair: pair[1], reverse=True)
-        candidates.append(frame_candidates[:max_peaks])
+    # backtrack
+    state_path = [0] * n_frames
+    state_path[-1] = int(np.argmax(dp[:, -1]))
+    for t in range(n_frames - 2, -1, -1):
+        state_path[t] = int(backptr[state_path[t + 1], t + 1])
 
-    return candidates
+    decoded = [states[idx] for idx in state_path]
 
+    # Enforce minimum dwell time by merging short segments into neighbors
+    min_frames = max(1, min_note_frames)
+    start = 0
+    while start < n_frames:
+        end = start
+        while end + 1 < n_frames and decoded[end + 1] == decoded[start]:
+            end += 1
+        run_length = end - start + 1
+        if run_length < min_frames and start > 0 and end < n_frames - 1:
+            prev_state = decoded[start - 1]
+            next_state = decoded[end + 1]
+            decoded[start : end + 1] = [prev_state if prev_state == next_state else next_state] * run_length
+        start = end + 1
 
-def _prune_harmonic_ghosts(frame_candidates: List[Tuple[float, float]], cents_tolerance: float) -> List[Tuple[float, float]]:
-    if not frame_candidates:
-        return []
-
-    kept: List[Tuple[float, float]] = []
-    for freq, prob in sorted(frame_candidates, key=lambda pair: pair[1], reverse=True):
-        if freq <= 0 or not np.isfinite(freq):
-            continue
-        keep = True
-        for kept_freq, _ in kept:
-            if kept_freq <= 0 or not np.isfinite(kept_freq):
-                continue
-            cents = 1200.0 * np.log2(freq / kept_freq)
-            if abs(cents) < cents_tolerance:
-                keep = False
-                break
-            octave_related = abs(abs(cents) - 1200.0) < cents_tolerance or abs(abs(cents) - 2400.0) < cents_tolerance
-            if octave_related:
-                keep = False
-                break
-        if keep:
-            kept.append((freq, prob))
-    return kept
-
-
-def _validate_swift_with_sacf(
-    y: np.ndarray,
-    sr: int,
-    hop_length: int,
-    candidates: List[List[Tuple[float, float]]],
-    sacf_threshold: float,
-    frame_length: int,
-) -> List[List[Tuple[float, float]]]:
-    if not candidates:
-        return []
-
-    frame_length = max(frame_length, hop_length * 2)
-    frames = librosa.util.frame(y, frame_length=frame_length, hop_length=hop_length).T
-    validated: List[List[Tuple[float, float]]] = []
-
-    for idx, frame_candidates in enumerate(candidates):
-        if idx >= len(frames):
-            validated.append([])
-            continue
-        ac = librosa.autocorrelate(frames[idx].astype(float))
-        if ac.size == 0:
-            validated.append([])
-            continue
-        ac = ac / (np.max(np.abs(ac)) + 1e-9)
-        frame_valid: List[Tuple[float, float]] = []
-        for freq, prob in frame_candidates:
-            if freq <= 0:
-                continue
-            lag = int(round(sr / freq))
-            if 0 < lag < len(ac) and ac[lag] >= sacf_threshold:
-                frame_valid.append((freq, min(float(prob), 1.0)))
-        validated.append(frame_valid)
-
-    return validated
-
-
-def _spectral_subtract_harmonics(
-    y: np.ndarray,
-    sr: int,
-    hop_length: int,
-    frame_length: int,
-    primary_freqs: np.ndarray,
-    num_harmonics: int,
-    width: int,
-    attenuation: float,
-) -> np.ndarray:
-    if num_harmonics <= 0 or attenuation <= 0.0:
-        return y
-
-    stft = librosa.stft(y, n_fft=frame_length, hop_length=hop_length)
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=frame_length)
-    mask = np.ones_like(stft, dtype=float)
-    width = max(1, int(width))
-    attenuation = np.clip(attenuation, 0.0, 1.0)
-
-    for frame_idx in range(min(len(primary_freqs), stft.shape[1])):
-        f0 = primary_freqs[frame_idx]
-        if not np.isfinite(f0) or f0 <= 0:
-            continue
-        for harmonic in range(1, num_harmonics + 1):
-            target_freq = harmonic * f0
-            if target_freq >= freqs[-1]:
-                break
-            bin_idx = int(np.argmin(np.abs(freqs - target_freq)))
-            start = max(0, bin_idx - width)
-            end = min(len(freqs), bin_idx + width + 1)
-            mask[start:end, frame_idx] *= 1.0 - attenuation
-
-    residual_stft = stft * mask
-    residual = librosa.istft(residual_stft, hop_length=hop_length, length=len(y))
-    return residual.astype(y.dtype, copy=False)
-
-
-def _align_candidates_to_targets(
-    swift_times: np.ndarray, target_times: np.ndarray, candidates: List[List[Tuple[float, float]]]
-) -> List[List[Tuple[float, float]]]:
-    if not candidates or swift_times.size == 0:
-        return [[] for _ in range(len(target_times))]
-
-    indices = np.searchsorted(swift_times, target_times, side="left")
-    indices = np.clip(indices, 0, len(candidates) - 1)
-    return [candidates[int(idx)] if int(idx) < len(candidates) else [] for idx in indices]
+    return decoded
 
 
 def _detector_yin(
@@ -637,7 +602,7 @@ def extract_features(
     velocity_humanization: float | None = None,
     velocity_seed: int | None = None,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
-    """Stage B: ensemble pitch detection with deterministic rules."""
+    """Stage B: ensemble pitch detection with HMM-based segmentation."""
     params = _stage_b_params()
     hop_length = params["hop_length"]
     harmonic_source = _mix_stems(meta, ["vocals", "bass", "other"])
@@ -724,88 +689,164 @@ def extract_features(
         if unstable_flag:
             timeline[-1].confidence = max(float(c), params["conf_min"])
 
-    # Stage C rules: deterministic segmentation
+    # Stage C rules: HMM-driven segmentation with hysteresis and tuning-aware quantization
     frame_duration = float(hop_length / sr)
     silence_frames_required = int(np.ceil(0.12 / frame_duration))
+    hysteresis_semitones = 0.35
+    min_duration_sec = params["min_note_frames"] * frame_duration
 
     # Spectral flux for onset/silence gating
     stft = np.abs(librosa.stft(base_y, n_fft=1024, hop_length=hop_length))
     flux = np.sqrt(np.sum(np.square(np.diff(stft, axis=1).clip(min=0)), axis=0))
     flux_threshold = params["onset_threshold_factor"] * np.median(np.abs(flux)) if flux.size else 0.0
 
+    hmm_states = _decode_hmm_states(timeline, frame_duration, params["min_note_frames"])
+    tuning_offset_cents = _estimate_tuning_offset(timeline)
+
     notes: List[NoteEvent] = []
-    current_note: NoteEvent | None = None
-    stable_run = 0
-    low_conf_run = 0
+    current: dict | None = None
     silence_run = 0
+    filtered_pitch = None
 
-    def cents_diff(a: float, b: float) -> float:
-        return abs(1200.0 * np.log2(a / b)) if a > 0 and b > 0 else 0.0
-
-    for idx, frame in enumerate(timeline):
-        pitch = frame.pitch_hz
-        confidence = frame.confidence
-        is_unstable = unstable[idx]
+    for idx, (frame, state) in enumerate(zip(timeline, hmm_states)):
+        pitch = frame.pitch_hz if frame.pitch_hz > 0 else 0.0
+        midi_val = float(librosa.hz_to_midi(pitch)) if pitch > 0 else None
+        conf = float(frame.confidence)
         frame_flux = flux[idx] if idx < len(flux) else 0.0
-        is_silent_frame = frame_flux < flux_threshold
+        is_silent_frame = state == "silence" or frame_flux < flux_threshold or conf < params["conf_min"]
 
-        if np.isfinite(pitch) and pitch > 0 and not is_unstable:
-            if current_note and cents_diff(pitch, current_note.pitch_hz) <= 30.0:
-                stable_run += 1
-            elif current_note is None:
-                stable_run = 1
-            else:
-                stable_run = 0
+        if is_silent_frame:
+            silence_run += 1
+            filtered_pitch = None
+            if current and silence_run >= silence_frames_required:
+                duration_sec = current["end_sec"] - current["start_sec"] + frame_duration
+                if duration_sec < min_duration_sec and notes:
+                    # Merge into previous note to avoid staccato fragments
+                    prev = notes[-1]
+                    current_pitch_avg = current["pitch_sum"] / max(current["conf_sum"], 1e-9)
+                    prev_dur = prev.end_sec - prev.start_sec
+                    total_dur = prev_dur + duration_sec
+                    weighted_pitch = (
+                        prev.pitch_hz * prev_dur + current_pitch_avg * duration_sec
+                    ) / max(total_dur, 1e-9)
+                    prev.end_sec = current["end_sec"] + frame_duration
+                    prev.pitch_hz = float(weighted_pitch)
+                    prev.confidence = max(prev.confidence, current["max_conf"])
+                    prev.velocity = max(prev.velocity, current["max_velocity"])
+                else:
+                    midi_avg = current["midi_sum"] / max(current["duration_frames"], 1)
+                    midi_note = int(round(midi_avg - tuning_offset_cents / 100.0))
+                    pitch_hz_avg = current["pitch_sum"] / max(current["conf_sum"], 1e-9)
+                    notes.append(
+                        NoteEvent(
+                            start_sec=current["start_sec"],
+                            end_sec=current["end_sec"] + frame_duration,
+                            midi_note=midi_note,
+                            pitch_hz=float(pitch_hz_avg),
+                            confidence=float(current["max_conf"]),
+                            velocity=float(current["max_velocity"]),
+                            amplitude=float(current["amplitude_sum"] / max(current["duration_frames"], 1)),
+                        )
+                    )
+                current = None
+            continue
+
+        silence_run = 0
+
+        if midi_val is None:
+            continue
+
+        if filtered_pitch is None:
+            filtered_pitch = midi_val
         else:
-            stable_run = 0
+            delta = midi_val - filtered_pitch
+            if abs(delta) > hysteresis_semitones:
+                filtered_pitch += delta * 0.5
+            filtered_pitch = 0.85 * filtered_pitch + 0.15 * midi_val
 
-        if confidence < params["conf_min"]:
-            low_conf_run += 1
-        else:
-            low_conf_run = 0
+        stable_midi = filtered_pitch if state == "stable" else midi_val
+        velocity = _map_velocity(rms[idx], rms_floor, rms_ceiling)
 
-        silence_run = silence_run + 1 if is_silent_frame else 0
+        if current is None:
+            current = {
+                "start_sec": frame.time,
+                "end_sec": frame.time,
+                "pitch_sum": pitch * conf,
+                "conf_sum": conf,
+                "max_conf": conf,
+                "midi_sum": stable_midi,
+                "duration_frames": 1,
+                "max_velocity": velocity,
+                "amplitude_sum": float(rms[idx]),
+            }
+            continue
 
-        if current_note is None:
-            if stable_run >= params["min_note_frames"] and confidence >= params["conf_min"]:
-                velocity = _map_velocity(rms[idx], rms_floor, rms_ceiling)
-                current_note = NoteEvent(
-                    start_sec=frame.time,
-                    end_sec=frame.time,
-                    midi_note=frame.midi or int(round(librosa.hz_to_midi(pitch))) if pitch > 0 else 0,
-                    pitch_hz=pitch,
-                    confidence=float(confidence),
-                    velocity=velocity,
-                    amplitude=float(rms[idx]),
+        midi_jump = abs(stable_midi - current["midi_sum"] / max(current["duration_frames"], 1))
+        if midi_jump > 1.5:
+            # End current note and start a new one
+            midi_avg = current["midi_sum"] / max(current["duration_frames"], 1)
+            midi_note = int(round(midi_avg - tuning_offset_cents / 100.0))
+            pitch_hz_avg = current["pitch_sum"] / max(current["conf_sum"], 1e-9)
+            notes.append(
+                NoteEvent(
+                    start_sec=current["start_sec"],
+                    end_sec=current["end_sec"] + frame_duration,
+                    midi_note=midi_note,
+                    pitch_hz=float(pitch_hz_avg),
+                    confidence=float(current["max_conf"]),
+                    velocity=float(current["max_velocity"]),
+                    amplitude=float(current["amplitude_sum"] / max(current["duration_frames"], 1)),
                 )
-                stable_run = 0
+            )
+            current = {
+                "start_sec": frame.time,
+                "end_sec": frame.time,
+                "pitch_sum": pitch * conf,
+                "conf_sum": conf,
+                "max_conf": conf,
+                "midi_sum": stable_midi,
+                "duration_frames": 1,
+                "max_velocity": velocity,
+                "amplitude_sum": float(rms[idx]),
+            }
             continue
 
-        # termination conditions
-        pitch_jump = cents_diff(pitch, current_note.pitch_hz) if pitch > 0 else 0.0
-        end_due_to_jump = pitch > 0 and pitch_jump > 120.0
-        end_due_to_conf = low_conf_run >= params["min_note_frames"]
-        end_due_to_silence = silence_run >= silence_frames_required
+        current["end_sec"] = frame.time
+        current["pitch_sum"] += pitch * conf
+        current["conf_sum"] += conf
+        current["max_conf"] = max(current["max_conf"], conf)
+        current["midi_sum"] += stable_midi
+        current["duration_frames"] += 1
+        current["max_velocity"] = max(current["max_velocity"], velocity)
+        current["amplitude_sum"] += float(rms[idx])
 
-        if end_due_to_jump or end_due_to_conf or end_due_to_silence:
-            current_note.end_sec = frame.time
-            notes.append(current_note)
-            current_note = None
-            low_conf_run = 0
-            silence_run = 0
-            stable_run = 0
-            continue
-
-        current_note.end_sec = frame.time
-        current_note.confidence = float(max(current_note.confidence, confidence))
-        current_note.pitch_hz = float(pitch if pitch > 0 else current_note.pitch_hz)
-        current_note.midi_note = current_note.midi_note if current_note.midi_note else (frame.midi or current_note.midi_note)
-        current_note.velocity = _map_velocity(rms[idx], rms_floor, rms_ceiling)
-        current_note.amplitude = float(rms[idx])
-
-    if current_note is not None:
-        current_note.end_sec = float(times[-1]) if len(times) else current_note.end_sec
-        notes.append(current_note)
+    if current is not None:
+        midi_avg = current["midi_sum"] / max(current["duration_frames"], 1)
+        midi_note = int(round(midi_avg - tuning_offset_cents / 100.0))
+        pitch_hz_avg = current["pitch_sum"] / max(current["conf_sum"], 1e-9)
+        duration_sec = current["end_sec"] - current["start_sec"] + frame_duration
+        if duration_sec >= min_duration_sec or not notes:
+            notes.append(
+                NoteEvent(
+                    start_sec=current["start_sec"],
+                    end_sec=current["end_sec"] + frame_duration,
+                    midi_note=midi_note,
+                    pitch_hz=float(pitch_hz_avg),
+                    confidence=float(current["max_conf"]),
+                    velocity=float(current["max_velocity"]),
+                    amplitude=float(current["amplitude_sum"] / max(current["duration_frames"], 1)),
+                )
+            )
+        elif notes:
+            prev = notes[-1]
+            current_pitch_avg = current["pitch_sum"] / max(current["conf_sum"], 1e-9)
+            prev_dur = prev.end_sec - prev.start_sec
+            total_dur = prev_dur + duration_sec
+            weighted_pitch = (prev.pitch_hz * prev_dur + current_pitch_avg * duration_sec) / max(total_dur, 1e-9)
+            prev.end_sec = current["end_sec"] + frame_duration
+            prev.pitch_hz = float(weighted_pitch)
+            prev.confidence = max(prev.confidence, current["max_conf"])
+            prev.velocity = max(prev.velocity, current["max_velocity"])
 
     meta.pitch_tracker = "ensemble"
     chords = _detect_chords_from_chroma(base_y, base_sr, hop_length)
